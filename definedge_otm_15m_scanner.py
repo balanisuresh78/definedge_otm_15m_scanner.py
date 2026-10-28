@@ -18,6 +18,10 @@ from email.mime.multipart import MIMEMultipart
 from tabulate import tabulate
 from integrate import ConnectToIntegrate, IntegrateData
 
+# Force real-time unbuffered logging in GitHub Actions console
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 # ==============================================================================
 # 1. CREDENTIALS & CONFIGURATION (LOADED SECURELY FROM GITHUB SECRETS)
 # ==============================================================================
@@ -140,7 +144,6 @@ def extract_strike_and_type_from_row(row, underlying, trading_symbol):
         except Exception:
             strike = None
 
-    # Fallback / verification via trading_symbol (handles both SBIN24NOV26C800 and SBIN24NOV26800CE)
     if strike is None or opt_type not in ("CE", "PE"):
         p_cp = r"^" + re.escape(underlying) + r"\d{2}[A-Z]{3}\d{2}(C|P)(\d+(?:\.\d+)?)$"
         m1 = re.match(p_cp, trading_symbol)
