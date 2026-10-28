@@ -37,9 +37,10 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
 
-# 15m ATR(2) Expansion Parameters
+# 15m ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
 ATR_MULT_THRESHOLD = 1.5
+VOL_MULT_THRESHOLD = 1.5
 ATR_METHOD = "SMA"  # "SMA" or "RMA"
 
 LOOKBACK_DAYS_15M = 7
@@ -292,7 +293,7 @@ def build_basket_task(conn, ic, now_ist):
     return basket
 
 # ==============================================================================
-# 5. 15-MINUTE RESAMPLING & ATR(2) BREAKOUT LOGIC
+# 5. 15-MINUTE RESAMPLING, ATR(2) & VOLUME BREAKOUT LOGIC
 # ==============================================================================
 def resample_to_15m(df_1m, now_ist):
     df = df_1m.copy().between_time("09:15", "15:29")
@@ -349,6 +350,13 @@ def calculate_atr(df, period=2):
     return tr.rolling(window=period, min_periods=period).mean()
 
 def evaluate_15m_option_breakout(df_15m):
+    """
+    Evaluates the latest closed 15m bar (bar 0) against the previous 15m bar (-1 bar):
+      1. Close > -1 bar close
+      2. Close > -1 bar high
+      3. ATR(2) > -1 bar ATR(2) * 1.5
+      4. Volume > -1 bar Volume * 1.5
+    """
     if len(df_15m) < ATR_PERIOD + 2:
         return None
 
@@ -360,18 +368,25 @@ def evaluate_15m_option_breakout(df_15m):
 
     cur_atr = float(cur_bar["atr2"])
     prev_atr = float(prev_bar["atr2"])
+    cur_vol = float(cur_bar["volume"])
+    prev_vol = float(prev_bar["volume"])
 
-    if pd.isna(cur_atr) or pd.isna(prev_atr) or prev_atr <= 0:
+    if (
+        pd.isna(cur_atr) or pd.isna(prev_atr) or prev_atr <= 0
+        or pd.isna(cur_vol) or pd.isna(prev_vol) or prev_vol <= 0
+    ):
         return None
 
     cond_close_gt_prev_close = float(cur_bar["close"]) > float(prev_bar["close"])
     cond_close_gt_prev_high = float(cur_bar["close"]) > float(prev_bar["high"])
     cond_atr_expansion = cur_atr > (prev_atr * ATR_MULT_THRESHOLD)
+    cond_vol_expansion = cur_vol > (prev_vol * VOL_MULT_THRESHOLD)
 
-    if not (cond_close_gt_prev_close and cond_close_gt_prev_high and cond_atr_expansion):
+    if not (cond_close_gt_prev_close and cond_close_gt_prev_high and cond_atr_expansion and cond_vol_expansion):
         return None
 
     atr_ratio = round(cur_atr / prev_atr, 2)
+    vol_ratio = round(cur_vol / prev_vol, 2)
     gain_pct = round(((float(cur_bar["close"]) - float(prev_bar["close"])) / float(prev_bar["close"])) * 100.0, 2)
 
     return {
@@ -383,6 +398,9 @@ def evaluate_15m_option_breakout(df_15m):
         "atr2": round(cur_atr, 2),
         "prev_atr2": round(prev_atr, 2),
         "atr_ratio": atr_ratio,
+        "vol": int(cur_vol),
+        "prev_vol": int(prev_vol),
+        "vol_ratio": vol_ratio,
         "gain_pct": gain_pct
     }
 
@@ -394,7 +412,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     for attempt in range(1, max_retries + 1):
         try:
             now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-            subject = f"⚡ 15m OTM Options ATR(2) Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+            subject = f"⚡ 15m OTM Options ATR(2) + Vol Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
             ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=lambda x: x["atr_ratio"], reverse=True)
             pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=lambda x: x["atr_ratio"], reverse=True)
@@ -405,7 +423,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
             body_lines = [
-                f"15m OTM Options Breakout Alert (Close > Prev Close & High | ATR(2) > 1.5x Prev ATR(2))",
+                f"15m OTM Options Breakout Alert (Close > -1 Close & High | ATR(2) > 1.5x | Vol > 1.5x)",
                 f"15m Bar: {bar_label} | Basket Size: {total_tracked} OTM Options (50 High-Beta Stocks)\n",
                 f"📋 OTM CALLS (CE) - Top 5 (Copy & Paste into Zone):\n{ce_top5}\n",
                 f"📋 OTM PUTS (PE) - Top 5 (Copy & Paste into Zone):\n{pe_top5}\n",
@@ -424,13 +442,14 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                     m["atr2"],
                     m["prev_atr2"],
                     f"{m['atr_ratio']}x",
+                    f"{m['vol_ratio']}x ({m['vol']:,})",
                     f"+{m['gain_pct']}%"
                 ]
                 for m in (ce_matches + pe_matches)
             ]
             headers = [
                 "Stock", "Option Symbol", "Type (Strike)", "15m Bar",
-                "Close", "-1 High", "ATR(2)", "-1 ATR(2)", "ATR Ratio", "Bar % Gain"
+                "Close", "-1 High", "ATR(2)", "-1 ATR(2)", "ATR Ratio", "Vol Ratio (Vol)", "Bar % Gain"
             ]
             body_lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
 
@@ -445,13 +464,13 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                 server.send_message(msg)
 
             print(f"✅ 15m OTM Options Alert Email sent successfully for {len(triggered_list)} contract(s)!")
-            return  # Exit successfully on successful send
+            return
         except Exception as e:
             print(f"⚠️ Email dispatch attempt {attempt}/{max_retries} failed: {e}")
             if attempt == max_retries:
                 print("❌ All email retry attempts failed for this batch!")
             else:
-                time.sleep(3)  # Wait 3 seconds before retrying SMTP connection
+                time.sleep(3)
 
 # ==============================================================================
 # 7. MAIN RUNNER WITH CONNECTION RETRY WRAPPER
@@ -500,7 +519,8 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
                 print(
                     f"  🔥 MATCH: {trd_sym} ({opt['opt_type']}) on {res['bar_time']} | "
                     f"Close: {res['close']} > -1 High: {res['prev_high']} | "
-                    f"ATR(2): {res['atr2']} vs -1 ATR(2): {res['prev_atr2']} ({res['atr_ratio']}x)"
+                    f"ATR(2): {res['atr2']} vs {res['prev_atr2']} ({res['atr_ratio']}x) | "
+                    f"Vol: {res['vol']:,} vs {res['prev_vol']:,} ({res['vol_ratio']}x)"
                 )
         except Exception as e:
             print(f"  ⚠️ Error scanning {trd_sym}: {e}")
@@ -554,7 +574,7 @@ def run_scanner(force_scan=False):
     if triggered_alerts:
         send_otm_15m_email_alert(triggered_alerts, latest_bar_seen, len(options_list))
     else:
-        print(f"ℹ️ No 15m OTM Options matched the ATR(2) breakout criteria on bar [{latest_bar_seen}].")
+        print(f"ℹ️ No 15m OTM Options matched the ATR(2) + Vol breakout criteria on bar [{latest_bar_seen}].")
 
 # ==============================================================================
 # 8. FULL-DAY CHAINED MARKET CLOCK
