@@ -36,12 +36,10 @@ MEMORY_BRANCH = "otm-15m-memory-state"
 # 15m ATR(2) Expansion Parameters
 ATR_PERIOD = 2
 ATR_MULT_THRESHOLD = 1.5
-# Set ATR_METHOD to "SMA" (Simple Moving Average, matching compression scripts)
-# or "RMA" (Wilder's Moving Average)
-ATR_METHOD = "SMA"
+ATR_METHOD = "SMA"  # "SMA" or "RMA"
 
 LOOKBACK_DAYS_15M = 7
-MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry; set to 2 to roll early near expiry
+MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry; set to 1 to skip Tuesday 0-DTE
 
 # Curated Liquid High-Beta 50 Subset (50 Stocks -> 50 OTM CE + 50 OTM PE = 100 Instruments)
 high_beta_50_stocks = [
@@ -122,15 +120,42 @@ def login_definedge():
     conn.login(api_token=API_TOKEN, api_secret=API_SECRET, totp=totp)
     return conn, IntegrateData(conn)
 
-def extract_strike_and_type(underlying, trading_symbol):
+def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     """
-    Extracts exact Strike Price and Option Type (CE/PE) from Definedge NFO
-    trading symbol (e.g., 'BAJAJ-AUTO29OCT2610100CE' -> (10100.0, 'CE')).
+    Extracts Strike Price and Option Type (CE/PE) using Definedge's official
+    master file columns (Col 8 = OPTIONTYPE, Col 9 = STRIKE, Col 10 = PRICEPREC,
+    Col 11 = MULTIPLIER), with regex fallback for both C/P and CE/PE symbol formats.
     """
-    pattern = r"^" + re.escape(underlying) + r"\d{2}[A-Z]{3}\d{2}(\d+(?:\.\d+)?)(CE|PE)$"
-    m = re.match(pattern, trading_symbol)
-    if m:
-        return float(m.group(1)), m.group(2)
+    opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
+    strike = None
+
+    if 9 in row.index and pd.notna(row[9]):
+        try:
+            raw_strike = float(row[9])
+            price_prec = int(row[10]) if (10 in row.index and pd.notna(row[10])) else 2
+            multiplier = float(row[11]) if (11 in row.index and pd.notna(row[11]) and float(row[11]) > 0) else 1.0
+            calc_strike = raw_strike / (multiplier * (10 ** price_prec))
+            if calc_strike > 0:
+                strike = round(calc_strike, 2)
+        except Exception:
+            strike = None
+
+    # Fallback / verification via trading_symbol (handles both SBIN24NOV26C800 and SBIN24NOV26800CE)
+    if strike is None or opt_type not in ("CE", "PE"):
+        p_cp = r"^" + re.escape(underlying) + r"\d{2}[A-Z]{3}\d{2}(C|P)(\d+(?:\.\d+)?)$"
+        m1 = re.match(p_cp, trading_symbol)
+        if m1:
+            opt_type = "CE" if m1.group(1) == "C" else "PE"
+            strike = float(m1.group(2))
+        else:
+            p_cepe = r"^" + re.escape(underlying) + r"\d{2}[A-Z]{3}\d{2}(\d+(?:\.\d+)?)(CE|PE)$"
+            m2 = re.match(p_cepe, trading_symbol)
+            if m2:
+                strike = float(m2.group(1))
+                opt_type = m2.group(2)
+
+    if strike is not None and opt_type in ("CE", "PE"):
+        return strike, opt_type
     return None, None
 
 def load_nfo_master_data(target_stocks):
@@ -175,7 +200,7 @@ def load_nfo_master_data(target_stocks):
     for _, row in opt_df.iterrows():
         und = row[2]
         trd_sym = row[3]
-        strike, opt_type = extract_strike_and_type(und, trd_sym)
+        strike, opt_type = extract_strike_and_type_from_row(row, und, trd_sym)
         if strike is not None and opt_type in ("CE", "PE"):
             options_by_stock[und].append({
                 "underlying": und,
@@ -259,8 +284,8 @@ def build_100_otm_option_basket(conn, ic, now_ist):
             if ce_candidates and pe_candidates:
                 print(
                     f"  ✅ {symbol} (Fut: {ref_price:.2f}) -> "
-                    f"OTM CE: {ce_candidates[0]['trading_symbol']} ({ce_candidates[0]['strike']}) | "
-                    f"OTM PE: {pe_candidates[0]['trading_symbol']} ({pe_candidates[0]['strike']})"
+                    f"OTM CE: {ce_candidates[0]['trading_symbol']} ({ce_candidates[0]['strike']:g}) | "
+                    f"OTM PE: {pe_candidates[0]['trading_symbol']} ({pe_candidates[0]['strike']:g})"
                 )
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM options for {symbol}: {e}")
@@ -276,7 +301,6 @@ def resample_to_15m(df_1m, now_ist):
     if df.empty:
         return pd.DataFrame()
 
-    last_1m_ts = df.index[-1]
     resampled_chunks = []
     for _, group in df.groupby(df.index.date):
         bars = group.resample(
@@ -454,9 +478,6 @@ def run_scanner(force_scan=False):
     memory = load_memory()
     conn, ic = login_definedge()
 
-    # Rebuild the 100-option basket if:
-    # 1. No basket exists for today, OR
-    # 2. The basket was built pre-market and live market hours have now started
     need_new_basket = (
         memory.get("basket_date") != today_str
         or not memory.get("options")
@@ -473,7 +494,8 @@ def run_scanner(force_scan=False):
 
     options_list = memory.get("options", [])
     if not options_list:
-        print("⚠️ No OTM Option contracts in basket. Exiting.")
+        print("⚠️ No OTM Option contracts in basket. Saving state & exiting.")
+        save_memory(memory)
         return
 
     expected_bar_label = get_expected_15m_bar_label(now_ist)
@@ -503,7 +525,6 @@ def run_scanner(force_scan=False):
             latest_bar_seen = df_15m.index[-1].strftime("%Y-%m-%d %H:%M")
 
             if res:
-                # During live market hours, only alert if the breakout happened on today's latest 15m bar
                 if expected_bar_label and res["bar_iso"] != expected_bar_label and not force_scan:
                     continue
 
@@ -547,7 +568,6 @@ def stay_awake_market_clock():
     session_mode = os.environ.get("SESSION_MODE", "MORNING")
     now_ist = datetime.now(IST)
 
-    # Outside live market hours (before 05:30 AM or after 03:33 PM): run once & exit
     if now_ist.time() < dtime(5, 30) or now_ist.time() > dtime(15, 33):
         if session_mode == "MORNING":
             print("🚀 Outside live market hours. Executing single test/basket pass...")
@@ -556,7 +576,6 @@ def stay_awake_market_clock():
             print("⏹️ Outside market hours (Afternoon job skipped).")
         return
 
-    # Morning job runs until 11:27 AM IST, then Afternoon job takes over until 15:34 PM IST
     if session_mode == "MORNING":
         if now_ist.time() >= dtime(11, 27):
             print("⏩ Already past 11:27 AM IST. Handing over immediately to Afternoon Session job...")
