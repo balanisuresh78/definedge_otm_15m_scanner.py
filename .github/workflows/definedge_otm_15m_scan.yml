@@ -1,0 +1,113 @@
+name: Definedge 15m OTM Options ATR(2) Scanner
+
+on:
+  schedule:
+    # Full Early-Morning Wake-Up Net (05:49 AM to 10:14 AM IST, staggered by 4m)
+    - cron: '19,34,49 0 * * 1-5'
+    - cron: '4,19,34,49 1 * * 1-5'
+    - cron: '4,19,34,49 2 * * 1-5'
+    - cron: '4,14,24,34,44,54 3 * * 1-5'
+    - cron: '4,19,34,44 4 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: definedge-otm-15m-intraday-scanner
+  cancel-in-progress: false
+
+jobs:
+  morning-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore otm_15m_memory.json from otm-15m-memory-state branch
+        run: |
+          git fetch origin otm-15m-memory-state:otm-15m-memory-state || true
+          git checkout otm-15m-memory-state -- otm_15m_memory.json 2>/dev/null || true
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install pyintegrate pyotp pandas numpy tabulate pytz requests
+
+      - name: Run Morning Session Clock (Until 11:27 AM IST)
+        env:
+          DEFINEDGE_API_TOKEN: ${{ secrets.DEFINEDGE_API_TOKEN }}
+          DEFINEDGE_API_SECRET: ${{ secrets.DEFINEDGE_API_SECRET }}
+          DEFINEDGE_TOTP_SECRET: ${{ secrets.DEFINEDGE_TOTP_SECRET }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          SESSION_MODE: "MORNING"
+        run: python definedge_otm_15m_scanner.py
+
+      - name: Save otm_15m_memory.json to otm-15m-memory-state branch
+        if: always()
+        run: |
+          if [ -f "otm_15m_memory.json" ]; then
+            cp otm_15m_memory.json /tmp/otm_15m_memory.json
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -B otm-15m-memory-state
+            cp /tmp/otm_15m_memory.json otm_15m_memory.json
+            git add otm_15m_memory.json
+            git commit -m "Update otm_15m_memory.json" || true
+            git push -f origin otm-15m-memory-state
+          fi
+
+  afternoon-session:
+    needs: morning-session
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 265
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore otm_15m_memory.json from otm-15m-memory-state branch
+        run: |
+          git fetch origin otm-15m-memory-state:otm-15m-memory-state || true
+          git checkout otm-15m-memory-state -- otm_15m_memory.json 2>/dev/null || true
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install pyintegrate pyotp pandas numpy tabulate pytz requests
+
+      - name: Run Afternoon Session Clock (11:27 AM to 03:34 PM IST)
+        env:
+          DEFINEDGE_API_TOKEN: ${{ secrets.DEFINEDGE_API_TOKEN }}
+          DEFINEDGE_API_SECRET: ${{ secrets.DEFINEDGE_API_SECRET }}
+          DEFINEDGE_TOTP_SECRET: ${{ secrets.DEFINEDGE_TOTP_SECRET }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          SESSION_MODE: "AFTERNOON"
+        run: python definedge_otm_15m_scanner.py
+
+      - name: Save otm_15m_memory.json to otm-15m-memory-state branch
+        if: always()
+        run: |
+          if [ -f "otm_15m_memory.json" ]; then
+            cp otm_15m_memory.json /tmp/otm_15m_memory.json
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -B otm-15m-memory-state
+            cp /tmp/otm_15m_memory.json otm_15m_memory.json
+            git add otm_15m_memory.json
+            git commit -m "Update otm_15m_memory.json" || true
+            git push -f origin otm-15m-memory-state
+          fi
