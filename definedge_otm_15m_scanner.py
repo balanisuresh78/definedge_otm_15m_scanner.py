@@ -43,7 +43,7 @@ ATR_MULT_THRESHOLD = 1.5
 ATR_METHOD = "SMA"  # "SMA" or "RMA"
 
 LOOKBACK_DAYS_15M = 7
-MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry; set to 1 to skip Tuesday 0-DTE
+MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry
 
 # Curated Liquid High-Beta 50 Subset (50 Stocks -> 50 OTM CE + 50 OTM PE = 100 Instruments)
 high_beta_50_stocks = [
@@ -116,7 +116,7 @@ def save_memory(memory_data):
     push_memory_to_git()
 
 # ==============================================================================
-# 3. DEFINEDGE LOGIN & MASTER SYMBOL PARSING (FUTURES + OPTSTK CHAIN)
+# 3. DEFINEDGE LOGIN & AUTO-RECONNECT WRAPPER
 # ==============================================================================
 def login_definedge():
     conn = ConnectToIntegrate()
@@ -124,12 +124,23 @@ def login_definedge():
     conn.login(api_token=API_TOKEN, api_secret=API_SECRET, totp=totp)
     return conn, IntegrateData(conn)
 
+def with_connection_retry(func, *args, **kwargs):
+    """Wraps Definedge API calls with automatic re-login on connection drops."""
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            conn, ic = login_definedge()
+            return func(conn, ic, *args, **kwargs)
+        except Exception as e:
+            print(f"⚠️ Definedge connection error on attempt {attempt}/{max_retries}: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(5)
+
+# ==============================================================================
+# 4. MASTER SYMBOL PARSING & BASKET BUILDER
+# ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
-    """
-    Extracts Strike Price and Option Type (CE/PE) using Definedge's official
-    master file columns (Col 8 = OPTIONTYPE, Col 9 = STRIKE, Col 10 = PRICEPREC,
-    Col 11 = MULTIPLIER), with regex fallback for both C/P and CE/PE symbol formats.
-    """
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
     strike = None
 
@@ -161,11 +172,10 @@ def extract_strike_and_type_from_row(row, underlying, trading_symbol):
         return strike, opt_type
     return None, None
 
-def load_nfo_master_data(target_stocks):
-    """Downloads allmaster.zip and extracts nearest active FUTSTK and OPTSTK chains."""
+def load_nfo_master_data(conn):
     today = datetime.now(IST).date()
     min_expiry = today + timedelta(days=MIN_DAYS_TO_EXPIRY)
-    stock_set = set(target_stocks)
+    stock_set = set(high_beta_50_stocks)
 
     url = "https://app.definedgesecurities.com/public/allmaster.zip"
     resp = requests.get(url, timeout=30)
@@ -190,11 +200,9 @@ def load_nfo_master_data(target_stocks):
 
     nfo = nfo[nfo["expiry"].notna() & (nfo["expiry"] >= min_expiry)]
 
-    # 1. Nearest Active Futures per Underlying (for Reference Underlying Price)
     fut_df = nfo[nfo[4] == "FUTSTK"].sort_values("expiry").groupby(2, as_index=False).first()
     fut_map = {row[2]: {"trading_symbol": row[3], "expiry": row["expiry"]} for _, row in fut_df.iterrows()}
 
-    # 2. Nearest Active Options Chain per Underlying
     opt_df = nfo[nfo[4] == "OPTSTK"].copy()
     min_opt_exp = opt_df.groupby(2)["expiry"].transform("min")
     opt_df = opt_df[opt_df["expiry"] == min_opt_exp]
@@ -239,12 +247,9 @@ def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
-# ==============================================================================
-# 4. BUILD DYNAMIC 100-INSTRUMENT BASKET (1 OTM CE + 1 OTM PE PER STOCK)
-# ==============================================================================
-def build_100_otm_option_basket(conn, ic, now_ist):
+def build_basket_task(conn, ic, now_ist):
     print(f"\n🎯 Building Dynamic 100-Option Basket (1 OTM CE + 1 OTM PE for {len(high_beta_50_stocks)} High-Beta Stocks)...")
-    fut_map, options_by_stock = load_nfo_master_data(high_beta_50_stocks)
+    fut_map, options_by_stock = load_nfo_master_data(conn)
     start_dt = (now_ist - timedelta(days=5)).replace(hour=9, minute=15, second=0, microsecond=0)
 
     basket = []
@@ -252,7 +257,6 @@ def build_100_otm_option_basket(conn, ic, now_ist):
         fut_info = fut_map.get(symbol)
         opt_chain = options_by_stock.get(symbol, [])
         if not fut_info or not opt_chain:
-            print(f"  ⚠️ Missing Futures/Options chain for {symbol}, skipping.")
             continue
 
         try:
@@ -262,12 +266,10 @@ def build_100_otm_option_basket(conn, ic, now_ist):
 
             ref_price = float(df_fut["close"].iloc[-1])
 
-            # 1 OTM Call = Lowest CE strike strictly above underlying reference price
             ce_candidates = sorted(
                 [o for o in opt_chain if o["opt_type"] == "CE" and o["strike"] > ref_price],
                 key=lambda x: x["strike"]
             )
-            # 1 OTM Put = Highest PE strike strictly below underlying reference price
             pe_candidates = sorted(
                 [o for o in opt_chain if o["opt_type"] == "PE" and o["strike"] < ref_price],
                 key=lambda x: x["strike"],
@@ -283,13 +285,6 @@ def build_100_otm_option_basket(conn, ic, now_ist):
                 otm_pe = dict(pe_candidates[0])
                 otm_pe["ref_fut_price"] = round(ref_price, 2)
                 basket.append(otm_pe)
-
-            if ce_candidates and pe_candidates:
-                print(
-                    f"  ✅ {symbol} (Fut: {ref_price:.2f}) -> "
-                    f"OTM CE: {ce_candidates[0]['trading_symbol']} ({ce_candidates[0]['strike']:g}) | "
-                    f"OTM PE: {pe_candidates[0]['trading_symbol']} ({pe_candidates[0]['strike']:g})"
-                )
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM options for {symbol}: {e}")
 
@@ -329,7 +324,6 @@ def resample_to_15m(df_1m, now_ist):
     df_15m = pd.concat(resampled_chunks).sort_index()
     today_date = now_ist.date()
 
-    # Only include closed 15-minute bars (bar start + 15m <= now_ist)
     if (df_15m.index.date == today_date).any():
         completed_mask = [
             (ts.date() < today_date)
@@ -355,12 +349,6 @@ def calculate_atr(df, period=2):
     return tr.rolling(window=period, min_periods=period).mean()
 
 def evaluate_15m_option_breakout(df_15m):
-    """
-    Evaluates the latest closed 15m bar (bar 0) against the previous 15m bar (-1 bar):
-      1. Close > -1 bar close
-      2. Close > -1 bar high
-      3. ATR(2) > -1 bar ATR(2) * 1.5
-    """
     if len(df_15m) < ATR_PERIOD + 2:
         return None
 
@@ -399,7 +387,7 @@ def evaluate_15m_option_breakout(df_15m):
     }
 
 # ==============================================================================
-# 6. EMAIL ALERT SENDER (GROUPED BY OTM CE & OTM PE, SORTED BY ATR RATIO)
+# 6. EMAIL ALERT SENDER
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
@@ -456,10 +444,9 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     print(f"✅ 15m OTM Options Alert Email sent for {len(triggered_list)} contract(s)!")
 
 # ==============================================================================
-# 7. MAIN RUNNER: DYNAMIC 100-OPTION BASKET + 15M BREAKOUT SCAN
+# 7. MAIN RUNNER WITH CONNECTION RETRY WRAPPER
 # ==============================================================================
 def get_expected_15m_bar_label(now_ist):
-    """Returns the start timestamp ('YYYY-MM-DD HH:MM') of the most recently closed 15m bar."""
     t = now_ist.time()
     if t < dtime(9, 30):
         return None
@@ -473,40 +460,7 @@ def get_expected_15m_bar_label(now_ist):
         bar_start = now_ist.replace(hour=bar_start_mins // 60, minute=bar_start_mins % 60, second=0, microsecond=0)
     return bar_start.strftime("%Y-%m-%d %H:%M")
 
-def run_scanner(force_scan=False):
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime("%Y-%m-%d")
-    is_live_hours = dtime(9, 15) <= now_ist.time() <= dtime(15, 35)
-
-    memory = load_memory()
-    conn, ic = login_definedge()
-
-    need_new_basket = (
-        memory.get("basket_date") != today_str
-        or not memory.get("options")
-        or (is_live_hours and not memory.get("basket_is_live", False))
-    )
-
-    if need_new_basket:
-        basket = build_100_otm_option_basket(conn, ic, now_ist)
-        if basket:
-            memory["basket_date"] = today_str
-            memory["basket_is_live"] = is_live_hours
-            memory["options"] = basket
-            save_memory(memory)
-
-    options_list = memory.get("options", [])
-    if not options_list:
-        print("⚠️ No OTM Option contracts in basket. Saving state & exiting.")
-        save_memory(memory)
-        return
-
-    expected_bar_label = get_expected_15m_bar_label(now_ist)
-    if not force_scan and expected_bar_label is not None:
-        if memory.get("last_scanned_15m_bar") == expected_bar_label:
-            print(f"ℹ️ 15m bar [{expected_bar_label}] already scanned. Skipping duplicate check.")
-            return
-
+def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
     print(f"\n🔎 Scanning {len(options_list)} OTM Options on 15m timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
     start_dt_15m = (now_ist - timedelta(days=LOOKBACK_DAYS_15M)).replace(hour=9, minute=15, second=0, microsecond=0)
 
@@ -541,6 +495,45 @@ def run_scanner(force_scan=False):
         except Exception as e:
             print(f"  ⚠️ Error scanning {trd_sym}: {e}")
 
+    return triggered_alerts, latest_bar_seen
+
+def run_scanner(force_scan=False):
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    is_live_hours = dtime(9, 15) <= now_ist.time() <= dtime(15, 35)
+
+    memory = load_memory()
+
+    need_new_basket = (
+        memory.get("basket_date") != today_str
+        or not memory.get("options")
+        or (is_live_hours and not memory.get("basket_is_live", False))
+    )
+
+    if need_new_basket:
+        basket = with_connection_retry(build_basket_task, now_ist)
+        if basket:
+            memory["basket_date"] = today_str
+            memory["basket_is_live"] = is_live_hours
+            memory["options"] = basket
+            save_memory(memory)
+
+    options_list = memory.get("options", [])
+    if not options_list:
+        print("⚠️ No OTM Option contracts in basket. Saving state & exiting.")
+        save_memory(memory)
+        return
+
+    expected_bar_label = get_expected_15m_bar_label(now_ist)
+    if not force_scan and expected_bar_label is not None:
+        if memory.get("last_scanned_15m_bar") == expected_bar_label:
+            print(f"ℹ️ 15m bar [{expected_bar_label}] already scanned. Skipping duplicate check.")
+            return
+
+    triggered_alerts, latest_bar_seen = with_connection_retry(
+        scan_task, options_list, expected_bar_label, now_ist, force_scan
+    )
+
     if expected_bar_label:
         memory["last_scanned_15m_bar"] = expected_bar_label
     elif latest_bar_seen:
@@ -554,7 +547,7 @@ def run_scanner(force_scan=False):
         print(f"ℹ️ No 15m OTM Options matched the ATR(2) breakout criteria on bar [{latest_bar_seen}].")
 
 # ==============================================================================
-# 8. FULL-DAY CHAINED MARKET CLOCK (MORNING -> AFTERNOON RELAY)
+# 8. FULL-DAY CHAINED MARKET CLOCK
 # ==============================================================================
 SCAN_CHECKPOINTS_IST = [
     dtime(9, 30, 12), dtime(9, 45, 12),
