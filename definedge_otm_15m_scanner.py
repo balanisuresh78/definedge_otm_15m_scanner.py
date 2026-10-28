@@ -387,61 +387,64 @@ def evaluate_15m_option_breakout(df_15m):
     }
 
 # ==============================================================================
-# 6. EMAIL ALERT SENDER
+# 6. SAFE EMAIL ALERT SENDER (WRAPPED IN TRY/EXCEPT)
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
-    now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-    subject = f"⚡ 15m OTM Options ATR(2) Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+    try:
+        now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
+        subject = f"⚡ 15m OTM Options ATR(2) Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
-    ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=lambda x: x["atr_ratio"], reverse=True)
-    pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=lambda x: x["atr_ratio"], reverse=True)
+        ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=lambda x: x["atr_ratio"], reverse=True)
+        pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=lambda x: x["atr_ratio"], reverse=True)
 
-    ce_top5 = ", ".join([m["trading_symbol"] for m in ce_matches[:5]]) or "None"
-    pe_top5 = ", ".join([m["trading_symbol"] for m in pe_matches[:5]]) or "None"
-    ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
-    pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
+        ce_top5 = ", ".join([m["trading_symbol"] for m in ce_matches[:5]]) or "None"
+        pe_top5 = ", ".join([m["trading_symbol"] for m in pe_matches[:5]]) or "None"
+        ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
+        pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
-    body_lines = [
-        f"15m OTM Options Breakout Alert (Close > Prev Close & High | ATR(2) > 1.5x Prev ATR(2))",
-        f"15m Bar: {bar_label} | Basket Size: {total_tracked} OTM Options (50 High-Beta Stocks)\n",
-        f"📋 OTM CALLS (CE) - Top 5 (Copy & Paste into Zone):\n{ce_top5}\n",
-        f"📋 OTM PUTS (PE) - Top 5 (Copy & Paste into Zone):\n{pe_top5}\n",
-        f"All CE ({len(ce_matches)}): {ce_all}",
-        f"All PE ({len(pe_matches)}): {pe_all}\n"
-    ]
-
-    table_rows = [
-        [
-            m["underlying"],
-            m["trading_symbol"],
-            f"{m['opt_type']} ({m['strike']:g})",
-            m["bar_time"],
-            m["close"],
-            m["prev_high"],
-            m["atr2"],
-            m["prev_atr2"],
-            f"{m['atr_ratio']}x",
-            f"+{m['gain_pct']}%"
+        body_lines = [
+            f"15m OTM Options Breakout Alert (Close > Prev Close & High | ATR(2) > 1.5x Prev ATR(2))",
+            f"15m Bar: {bar_label} | Basket Size: {total_tracked} OTM Options (50 High-Beta Stocks)\n",
+            f"📋 OTM CALLS (CE) - Top 5 (Copy & Paste into Zone):\n{ce_top5}\n",
+            f"📋 OTM PUTS (PE) - Top 5 (Copy & Paste into Zone):\n{pe_top5}\n",
+            f"All CE ({len(ce_matches)}): {ce_all}",
+            f"All PE ({len(pe_matches)}): {pe_all}\n"
         ]
-        for m in (ce_matches + pe_matches)
-    ]
-    headers = [
-        "Stock", "Option Symbol", "Type (Strike)", "15m Bar",
-        "Close", "-1 High", "ATR(2)", "-1 ATR(2)", "ATR Ratio", "Bar % Gain"
-    ]
-    body_lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
 
-    msg = MIMEMultipart()
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECEIVER_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText("\n".join(body_lines), "plain"))
+        table_rows = [
+            [
+                m["underlying"],
+                m["trading_symbol"],
+                f"{m['opt_type']} ({m['strike']:g})",
+                m["bar_time"],
+                m["close"],
+                m["prev_high"],
+                m["atr2"],
+                m["prev_atr2"],
+                f"{m['atr_ratio']}x",
+                f"+{m['gain_pct']}%"
+            ]
+            for m in (ce_matches + pe_matches)
+        ]
+        headers = [
+            "Stock", "Option Symbol", "Type (Strike)", "15m Bar",
+            "Close", "-1 High", "ATR(2)", "-1 ATR(2)", "ATR Ratio", "Bar % Gain"
+        ]
+        body_lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.send_message(msg)
+        msg = MIMEMultipart()
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = RECEIVER_EMAIL
+        msg["Subject"] = subject
+        msg.attach(MIMEText("\n".join(body_lines), "plain"))
 
-    print(f"✅ 15m OTM Options Alert Email sent for {len(triggered_list)} contract(s)!")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            server.login(SENDER_EMAIL, APP_PASSWORD)
+            server.send_message(msg)
+
+        print(f"✅ 15m OTM Options Alert Email sent for {len(triggered_list)} contract(s)!")
+    except Exception as e:
+        print(f"⚠️ Email dispatch warning (matches found, but SMTP failed): {e}")
 
 # ==============================================================================
 # 7. MAIN RUNNER WITH CONNECTION RETRY WRAPPER
