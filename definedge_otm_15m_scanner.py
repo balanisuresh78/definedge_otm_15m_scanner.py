@@ -36,7 +36,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
-BASKET_VERSION = "v4_yest_filter_algo_id"
+BASKET_VERSION = "v5_yest_filter_algo_zero"
 
 # 15m ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
@@ -470,7 +470,7 @@ def evaluate_15m_option_breakout(df_15m):
     }
 
 # ==============================================================================
-# 6. LIVE DEFINEDGE ORDER EXECUTION (IntegrateOrders with algo_id)
+# 6. LIVE DEFINEDGE ORDER EXECUTION (IntegrateOrders with algo_id="0")
 # ==============================================================================
 def round_to_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
@@ -541,7 +541,7 @@ def execute_buy_orders_for_matches(triggered_list, memory):
                 product_type=prod_type,
                 quantity=qty,
                 tradingsymbol=trd_sym,
-                algo_id=""  # Required positional/keyword argument for pyintegrate
+                algo_id="0"  # Fixed: Definedge requires a non-blank algo_id string like "0"
             )
             order_id = resp.get("order_id") or resp.get("norenordno") or resp.get("status") or "Sent"
             status_str = str(resp.get("status", "")).upper()
