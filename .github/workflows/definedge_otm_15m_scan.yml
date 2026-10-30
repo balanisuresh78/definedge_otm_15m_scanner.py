@@ -2,12 +2,8 @@ name: Definedge 15m OTM Options ATR(2) Scanner
 
 on:
   schedule:
-    # Full Early-Morning Wake-Up Net (05:49 AM to 10:14 AM IST, staggered by 4m)
-    - cron: '19,34,49 0 * * 1-5'
-    - cron: '4,19,34,49 1 * * 1-5'
-    - cron: '4,19,34,49 2 * * 1-5'
-    - cron: '4,14,24,34,44,54 3 * * 1-5'
-    - cron: '4,19,34,44 4 * * 1-5'
+    # Continuous 5-Minute Wake-Up Net from 08:30 AM IST to 03:25 PM IST (03:00 to 09:55 UTC)
+    - cron: '*/5 3-9 * * 1-5'
   workflow_dispatch:
 
 permissions:
