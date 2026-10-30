@@ -36,6 +36,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
+BASKET_VERSION = "v2_yest_filter"
 
 # 15m ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
@@ -43,10 +44,15 @@ ATR_MULT_THRESHOLD = 1.5
 VOL_MULT_THRESHOLD = 1.5
 ATR_METHOD = "SMA"  # "SMA" or "RMA"
 
+# Yesterday Trend Filter Mode for Morning Basket Harvesting:
+# "CLOSE_VS_PREV_CLOSE" -> Down Day = Yesterday Close < Day-Before Close | Up Day = Yesterday Close > Day-Before Close
+# "CLOSE_VS_OPEN"       -> Down Day = Yesterday Close < Yesterday Open   | Up Day = Yesterday Close > Yesterday Open
+YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
+
 LOOKBACK_DAYS_15M = 7
 MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry
 
-# Curated Liquid High-Beta 50 Subset (50 Stocks -> 50 OTM CE + 50 OTM PE = 100 Instruments)
+# Curated Liquid High-Beta 50 Subset
 high_beta_50_stocks = [
     # High-Beta Banks & NBFCs (12)
     "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
@@ -72,6 +78,7 @@ def default_memory():
     return {
         "basket_date": "",
         "basket_is_live": False,
+        "basket_version": "",
         "last_scanned_15m_bar": "",
         "options": []
     }
@@ -103,7 +110,7 @@ def push_memory_to_git():
             f"git add {MEMORY_FILE}",
             f'git commit -m "Update {MEMORY_FILE}" || true',
             f"git push -f origin {MEMORY_BRANCH}",
-            "git checkout -f main",
+            "git checkout -f main || git checkout -f master",
             f"cp /tmp/{MEMORY_FILE}_backup.json {MEMORY_FILE}"
         ]
         subprocess.run(" && ".join(cmds), shell=True, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -139,7 +146,7 @@ def with_connection_retry(func, *args, **kwargs):
             time.sleep(5)
 
 # ==============================================================================
-# 4. MASTER SYMBOL PARSING & BASKET BUILDER
+# 4. MASTER SYMBOL PARSING & FILTERED BASKET BUILDER (DOWN YEST -> CE | UP YEST -> PE)
 # ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
@@ -248,12 +255,56 @@ def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def get_yesterday_direction(df_fut_1m, today_date):
+    """
+    Determines whether the underlying stock had an UP day or DOWN day yesterday
+    using completed trading sessions prior to today_date.
+    Returns: ("DOWN" or "UP" or "FLAT", yest_pct_change)
+    """
+    df_prev = df_fut_1m[df_fut_1m.index.date < today_date].between_time("09:15", "15:29")
+    if df_prev.empty:
+        return "FLAT", 0.0
+
+    daily_summary = df_prev.groupby(df_prev.index.date).agg(
+        open=("open", "first"),
+        close=("close", "last")
+    ).dropna()
+
+    if daily_summary.empty:
+        return "FLAT", 0.0
+
+    yest_open = float(daily_summary["open"].iloc[-1])
+    yest_close = float(daily_summary["close"].iloc[-1])
+
+    if YESTERDAY_TREND_MODE.upper() == "CLOSE_VS_OPEN" or len(daily_summary) < 2:
+        ref_base = yest_open
+    else:
+        ref_base = float(daily_summary["close"].iloc[-2])
+
+    if ref_base <= 0:
+        return "FLAT", 0.0
+
+    pct_chg = round(((yest_close - ref_base) / ref_base) * 100.0, 2)
+    if yest_close < ref_base:
+        return "DOWN", pct_chg
+    elif yest_close > ref_base:
+        return "UP", pct_chg
+    return "FLAT", 0.0
+
 def build_basket_task(conn, ic, now_ist):
-    print(f"\n🎯 Building Dynamic 100-Option Basket (1 OTM CE + 1 OTM PE for {len(high_beta_50_stocks)} High-Beta Stocks)...")
+    print(
+        f"\n🎯 Building Filtered OTM Option Basket for {len(high_beta_50_stocks)} High-Beta Stocks "
+        f"(Down Yesterday -> OTM CE | Up Yesterday -> OTM PE | Mode: {YESTERDAY_TREND_MODE})..."
+    )
     fut_map, options_by_stock = load_nfo_master_data(conn)
-    start_dt = (now_ist - timedelta(days=5)).replace(hour=9, minute=15, second=0, microsecond=0)
+    # Fetch 10 calendar days of 1m Futures data to guarantee at least 2 prior trading days + live price
+    start_dt = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
+    today_date = now_ist.date()
 
     basket = []
+    ce_count = 0
+    pe_count = 0
+
     for symbol in high_beta_50_stocks:
         fut_info = fut_map.get(symbol)
         opt_chain = options_by_stock.get(symbol, [])
@@ -266,30 +317,49 @@ def build_basket_task(conn, ic, now_ist):
                 continue
 
             ref_price = float(df_fut["close"].iloc[-1])
+            yest_dir, yest_pct = get_yesterday_direction(df_fut, today_date)
 
-            ce_candidates = sorted(
-                [o for o in opt_chain if o["opt_type"] == "CE" and o["strike"] > ref_price],
-                key=lambda x: x["strike"]
-            )
-            pe_candidates = sorted(
-                [o for o in opt_chain if o["opt_type"] == "PE" and o["strike"] < ref_price],
-                key=lambda x: x["strike"],
-                reverse=True
-            )
+            if yest_dir == "DOWN":
+                # Underlying had a DOWN day yesterday -> Harvest ONLY nearest 1 OTM Call (CE)
+                ce_candidates = sorted(
+                    [o for o in opt_chain if o["opt_type"] == "CE" and o["strike"] > ref_price],
+                    key=lambda x: x["strike"]
+                )
+                if ce_candidates:
+                    otm_ce = dict(ce_candidates[0])
+                    otm_ce["ref_fut_price"] = round(ref_price, 2)
+                    otm_ce["yest_dir"] = "DOWN"
+                    otm_ce["yest_pct"] = yest_pct
+                    basket.append(otm_ce)
+                    ce_count += 1
+                    print(
+                        f"  📉 {symbol} (Yest: {yest_pct:+.2f}% DOWN | Fut: {ref_price:.2f}) -> "
+                        f"OTM CE: {otm_ce['trading_symbol']} ({otm_ce['strike']:g})"
+                    )
 
-            if ce_candidates:
-                otm_ce = dict(ce_candidates[0])
-                otm_ce["ref_fut_price"] = round(ref_price, 2)
-                basket.append(otm_ce)
+            elif yest_dir == "UP":
+                # Underlying had an UP day yesterday -> Harvest ONLY nearest 1 OTM Put (PE)
+                pe_candidates = sorted(
+                    [o for o in opt_chain if o["opt_type"] == "PE" and o["strike"] < ref_price],
+                    key=lambda x: x["strike"],
+                    reverse=True
+                )
+                if pe_candidates:
+                    otm_pe = dict(pe_candidates[0])
+                    otm_pe["ref_fut_price"] = round(ref_price, 2)
+                    otm_pe["yest_dir"] = "UP"
+                    otm_pe["yest_pct"] = yest_pct
+                    basket.append(otm_pe)
+                    pe_count += 1
+                    print(
+                        f"  📈 {symbol} (Yest: {yest_pct:+.2f}% UP   | Fut: {ref_price:.2f}) -> "
+                        f"OTM PE: {otm_pe['trading_symbol']} ({otm_pe['strike']:g})"
+                    )
 
-            if pe_candidates:
-                otm_pe = dict(pe_candidates[0])
-                otm_pe["ref_fut_price"] = round(ref_price, 2)
-                basket.append(otm_pe)
         except Exception as e:
-            print(f"  ⚠️ Error selecting OTM options for {symbol}: {e}")
+            print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
 
-    print(f"🎯 Basket Ready: {len(basket)} OTM Option contracts locked in.")
+    print(f"🎯 Basket Ready: {len(basket)} OTM Contracts locked in ({ce_count} OTM CEs + {pe_count} OTM PEs).")
     return basket
 
 # ==============================================================================
@@ -412,7 +482,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     for attempt in range(1, max_retries + 1):
         try:
             now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-            subject = f"⚡ 15m OTM Options ATR(2) + Vol Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+            subject = f"⚡ 15m OTM Options Reversal Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
             ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=lambda x: x["atr_ratio"], reverse=True)
             pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=lambda x: x["atr_ratio"], reverse=True)
@@ -423,17 +493,17 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
             body_lines = [
-                f"15m OTM Options Breakout Alert (Close > -1 Close & High | ATR(2) > 1.5x | Vol > 1.5x)",
-                f"15m Bar: {bar_label} | Basket Size: {total_tracked} OTM Options (50 High-Beta Stocks)\n",
-                f"📋 OTM CALLS (CE) - Top 5 (Copy & Paste into Zone):\n{ce_top5}\n",
-                f"📋 OTM PUTS (PE) - Top 5 (Copy & Paste into Zone):\n{pe_top5}\n",
+                f"15m OTM Options Reversal Alert (Down Yest -> CE | Up Yest -> PE | ATR(2) > 1.5x | Vol > 1.5x)",
+                f"15m Bar: {bar_label} | Basket Size: {total_tracked} Filtered OTM Options\n",
+                f"📋 OTM CALLS (CE - Stock Down Yesterday) - Top 5:\n{ce_top5}\n",
+                f"📋 OTM PUTS (PE - Stock Up Yesterday) - Top 5:\n{pe_top5}\n",
                 f"All CE ({len(ce_matches)}): {ce_all}",
                 f"All PE ({len(pe_matches)}): {pe_all}\n"
             ]
 
             table_rows = [
                 [
-                    m["underlying"],
+                    f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
                     m["trading_symbol"],
                     f"{m['opt_type']} ({m['strike']:g})",
                     m["bar_time"],
@@ -448,7 +518,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                 for m in (ce_matches + pe_matches)
             ]
             headers = [
-                "Stock", "Option Symbol", "Type (Strike)", "15m Bar",
+                "Stock (Yest %)", "Option Symbol", "Type (Strike)", "15m Bar",
                 "Close", "-1 High", "ATR(2)", "-1 ATR(2)", "ATR Ratio", "Vol Ratio (Vol)", "Bar % Gain"
             ]
             body_lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
@@ -490,7 +560,7 @@ def get_expected_15m_bar_label(now_ist):
     return bar_start.strftime("%Y-%m-%d %H:%M")
 
 def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
-    print(f"\n🔎 Scanning {len(options_list)} OTM Options on 15m timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
+    print(f"\n🔎 Scanning {len(options_list)} Filtered OTM Options on 15m timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
     start_dt_15m = (now_ist - timedelta(days=LOOKBACK_DAYS_15M)).replace(hour=9, minute=15, second=0, microsecond=0)
 
     triggered_alerts = []
@@ -517,7 +587,7 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
                 alert_item = {**opt, **res}
                 triggered_alerts.append(alert_item)
                 print(
-                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']}) on {res['bar_time']} | "
+                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Yest: {opt.get('yest_pct', 0):+.1f}%) on {res['bar_time']} | "
                     f"Close: {res['close']} > -1 High: {res['prev_high']} | "
                     f"ATR(2): {res['atr2']} vs {res['prev_atr2']} ({res['atr_ratio']}x) | "
                     f"Vol: {res['vol']:,} vs {res['prev_vol']:,} ({res['vol_ratio']}x)"
@@ -534,8 +604,10 @@ def run_scanner(force_scan=False):
 
     memory = load_memory()
 
+    # One-time daily basket harvest at live market open (or if basket_version changed)
     need_new_basket = (
         memory.get("basket_date") != today_str
+        or memory.get("basket_version") != BASKET_VERSION
         or not memory.get("options")
         or (is_live_hours and not memory.get("basket_is_live", False))
     )
@@ -545,6 +617,7 @@ def run_scanner(force_scan=False):
         if basket:
             memory["basket_date"] = today_str
             memory["basket_is_live"] = is_live_hours
+            memory["basket_version"] = BASKET_VERSION
             memory["options"] = basket
             save_memory(memory)
 
@@ -577,7 +650,7 @@ def run_scanner(force_scan=False):
         print(f"ℹ️ No 15m OTM Options matched the ATR(2) + Vol breakout criteria on bar [{latest_bar_seen}].")
 
 # ==============================================================================
-# 8. FULL-DAY CHAINED MARKET CLOCK
+# 8. FULL-DAY CHAINED MARKET CLOCK WITH HEARTBEAT SLEEP
 # ==============================================================================
 SCAN_CHECKPOINTS_IST = [
     dtime(9, 30, 12), dtime(9, 45, 12),
@@ -589,12 +662,25 @@ SCAN_CHECKPOINTS_IST = [
     dtime(15, 0, 12), dtime(15, 15, 12), dtime(15, 30, 12),
 ]
 
+def heartbeat_sleep(target_dt):
+    """Sleeps until target_dt in max 5-minute chunks so GitHub Actions never drops an idle runner."""
+    while True:
+        now_ist = datetime.now(IST)
+        rem = (target_dt - now_ist).total_seconds()
+        if rem <= 0:
+            break
+        chunk = min(rem, 300.0)
+        time.sleep(max(1.0, chunk))
+        now_ist = datetime.now(IST)
+        if (target_dt - now_ist).total_seconds() > 30:
+            print(f"💓 Heartbeat at {now_ist.strftime('%H:%M:%S IST')} — waiting for {target_dt.strftime('%H:%M:%S IST')}...")
+
 def stay_awake_market_clock():
     event_name = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
     session_mode = os.environ.get("SESSION_MODE", "MORNING")
     now_ist = datetime.now(IST)
 
-    if now_ist.time() < dtime(5, 30) or now_ist.time() > dtime(15, 33):
+    if now_ist.time() < dtime(8, 0) or now_ist.time() > dtime(15, 33):
         if session_mode == "MORNING":
             print("🚀 Outside live market hours. Executing single test/basket pass...")
             run_scanner(force_scan=(event_name == "workflow_dispatch"))
@@ -612,7 +698,15 @@ def stay_awake_market_clock():
 
     print(f"⏰ [{session_mode}] 15m OTM Options Clock active (Started {now_ist.strftime('%H:%M:%S IST')}, Cutoff: {session_cutoff.strftime('%H:%M IST')}).")
 
-    if dtime(9, 30, 12) <= now_ist.time() <= dtime(15, 33):
+    # Pre-warm the basket if booted between 09:16 AM and 09:30 AM IST
+    if dtime(9, 16) <= now_ist.time() < dtime(9, 30, 12):
+        print(f"🌅 Pre-warming today's Filtered OTM Basket at {now_ist.strftime('%H:%M:%S IST')}...")
+        try:
+            run_scanner(force_scan=False)
+        except Exception as e:
+            print(f"⚠️ Pre-warm warning: {e}")
+
+    elif dtime(9, 30, 12) <= now_ist.time() <= dtime(15, 33):
         print(f"🔔 Initial catch-up scan at {now_ist.strftime('%H:%M:%S IST')}...")
         try:
             run_scanner(force_scan=False)
@@ -639,7 +733,7 @@ def stay_awake_market_clock():
         next_dt = future_points[0]
         sleep_secs = (next_dt - now_ist).total_seconds()
         print(f"💤 Sleeping {round(sleep_secs / 60, 1)} min until next checkpoint: {next_dt.strftime('%H:%M:%S IST')}...")
-        time.sleep(max(1.0, sleep_secs))
+        heartbeat_sleep(next_dt)
 
         now_ist = datetime.now(IST)
         print(f"\n🔔 Checkpoint reached at {now_ist.strftime('%H:%M:%S IST')}. Running 15m OTM scanner...")
