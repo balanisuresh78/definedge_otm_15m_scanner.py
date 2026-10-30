@@ -36,7 +36,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
-BASKET_VERSION = "v3_yest_filter_orders"
+BASKET_VERSION = "v4_yest_filter_algo_id"
 
 # 15m ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
@@ -234,7 +234,6 @@ def load_nfo_master_data(conn):
         und = row[2]
         trd_sym = row[3]
         strike, opt_type = extract_strike_and_type_from_row(row, und, trd_sym)
-        # Column 7 in Definedge allmaster.zip is LOTSIZE
         try:
             lot_size = int(float(row[7])) if (7 in row.index and pd.notna(row[7]) and float(row[7]) > 0) else 1
         except Exception:
@@ -277,10 +276,6 @@ def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt):
     return df
 
 def get_yesterday_direction(df_fut_1m, today_date):
-    """
-    Determines whether the underlying stock had an UP day or DOWN day yesterday
-    using completed trading sessions prior to today_date.
-    """
     df_prev = df_fut_1m[df_fut_1m.index.date < today_date].between_time("09:15", "15:29")
     if df_prev.empty:
         return "FLAT", 0.0
@@ -350,11 +345,6 @@ def build_basket_task(conn, ic, now_ist):
                     otm_ce["yest_pct"] = yest_pct
                     basket.append(otm_ce)
                     ce_count += 1
-                    print(
-                        f"  📉 {symbol} (Yest: {yest_pct:+.2f}% DOWN | Fut: {ref_price:.2f}) -> "
-                        f"OTM CE: {otm_ce['trading_symbol']} (Lot: {otm_ce['lot_size']})"
-                    )
-
             elif yest_dir == "UP":
                 pe_candidates = sorted(
                     [o for o in opt_chain if o["opt_type"] == "PE" and o["strike"] < ref_price],
@@ -368,11 +358,6 @@ def build_basket_task(conn, ic, now_ist):
                     otm_pe["yest_pct"] = yest_pct
                     basket.append(otm_pe)
                     pe_count += 1
-                    print(
-                        f"  📈 {symbol} (Yest: {yest_pct:+.2f}% UP   | Fut: {ref_price:.2f}) -> "
-                        f"OTM PE: {otm_pe['trading_symbol']} (Lot: {otm_pe['lot_size']})"
-                    )
-
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
 
@@ -485,20 +470,15 @@ def evaluate_15m_option_breakout(df_15m):
     }
 
 # ==============================================================================
-# 6. LIVE DEFINEDGE ORDER EXECUTION (IntegrateOrders)
+# 6. LIVE DEFINEDGE ORDER EXECUTION (IntegrateOrders with algo_id)
 # ==============================================================================
 def round_to_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
 
 def execute_buy_orders_for_matches(triggered_list, memory):
-    """
-    Sends BUY orders to Definedge for the top-ranked matches on the current bar,
-    respecting MAX_ORDERS_PER_BAR, MAX_ORDERS_PER_DAY, and duplicate protection.
-    """
     is_live_market = dtime(9, 15) <= datetime.now(IST).time() <= dtime(15, 29, 50)
     orders_today = memory.get("orders_placed_today", [])
 
-    # Sort all matches by highest ATR Ratio so we prioritize the strongest breakouts
     ranked_matches = sorted(triggered_list, key=lambda x: x["atr_ratio"], reverse=True)
 
     if not ENABLE_LIVE_ORDERS:
@@ -508,7 +488,7 @@ def execute_buy_orders_for_matches(triggered_list, memory):
 
     if not is_live_market:
         for m in ranked_matches:
-            m["order_info"] = "⏹️ After-Hours (No Order)"
+            m["order_info"] = "⏹️ After-Hours"
         return ranked_matches
 
     try:
@@ -517,7 +497,7 @@ def execute_buy_orders_for_matches(triggered_list, memory):
     except Exception as e:
         print(f"⚠️ Could not initialize IntegrateOrders: {e}")
         for m in ranked_matches:
-            m["order_info"] = f"❌ Login Err"
+            m["order_info"] = "❌ Login Err"
         return ranked_matches
 
     orders_sent_this_bar = 0
@@ -527,25 +507,23 @@ def execute_buy_orders_for_matches(triggered_list, memory):
         qty = lot_size * LOTS_PER_TRADE
 
         if trd_sym in orders_today:
-            m["order_info"] = "⏭️ Already Bought Today"
+            m["order_info"] = "⏭️ Already Bought"
             continue
 
         if len(orders_today) >= MAX_ORDERS_PER_DAY:
-            m["order_info"] = f"⏭️ Daily Cap ({MAX_ORDERS_PER_DAY}) Hit"
+            m["order_info"] = f"⏭️ Daily Cap"
             continue
 
         if orders_sent_this_bar >= MAX_ORDERS_PER_BAR:
-            m["order_info"] = f"⏭️ Bar Cap (Top {MAX_ORDERS_PER_BAR})"
+            m["order_info"] = f"⏭️ Bar Cap"
             continue
 
-        # Product Type: INTRADAY or NORMAL
         prod_type = (
             getattr(conn, "PRODUCT_TYPE_NORMAL", "M")
             if ORDER_PRODUCT_TYPE.upper() == "NORMAL"
             else getattr(conn, "PRODUCT_TYPE_INTRADAY", "I")
         )
 
-        # Price Type: LIMIT (with buffer) or MARKET
         if ORDER_PRICE_TYPE.upper() == "MARKET":
             p_type = getattr(conn, "PRICE_TYPE_MARKET", "MKT")
             order_price = 0
@@ -562,7 +540,8 @@ def execute_buy_orders_for_matches(triggered_list, memory):
                 price_type=p_type,
                 product_type=prod_type,
                 quantity=qty,
-                tradingsymbol=trd_sym
+                tradingsymbol=trd_sym,
+                algo_id=""  # Required positional/keyword argument for pyintegrate
             )
             order_id = resp.get("order_id") or resp.get("norenordno") or resp.get("status") or "Sent"
             status_str = str(resp.get("status", "")).upper()
@@ -711,7 +690,6 @@ def run_scanner(force_scan=False):
 
     memory = load_memory()
 
-    # Reset daily order tracker on a new trading day
     if memory.get("basket_date") != today_str:
         memory["orders_placed_today"] = []
 
@@ -753,11 +731,8 @@ def run_scanner(force_scan=False):
         memory["last_scanned_15m_bar"] = latest_bar_seen
 
     if triggered_alerts:
-        # 1. Place live BUY orders on Definedge simultaneously & attach order status
         triggered_alerts = execute_buy_orders_for_matches(triggered_alerts, memory)
-        # 2. Save updated memory (including orders_placed_today)
         save_memory(memory)
-        # 3. Send Email Alert with Order Status column
         send_otm_15m_email_alert(triggered_alerts, latest_bar_seen, len(options_list))
     else:
         save_memory(memory)
@@ -777,7 +752,6 @@ SCAN_CHECKPOINTS_IST = [
 ]
 
 def heartbeat_sleep(target_dt):
-    """Sleeps until target_dt in max 5-minute chunks so GitHub Actions never drops an idle runner."""
     while True:
         now_ist = datetime.now(IST)
         rem = (target_dt - now_ist).total_seconds()
@@ -857,4 +831,3 @@ def stay_awake_market_clock():
 
 if __name__ == "__main__":
     stay_awake_market_clock()
-
