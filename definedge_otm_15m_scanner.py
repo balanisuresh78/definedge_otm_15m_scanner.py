@@ -36,7 +36,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
-BASKET_VERSION = "v9_inverted_vol_clean_table"
+BASKET_VERSION = "v10_larger_cell_font"
 
 # 15m Option ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
@@ -462,10 +462,6 @@ def evaluate_15m_option_breakout(df_15m):
     }
 
 def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slot_cache):
-    """
-    Calculates Inverted Underlying Slot Volume Ratio:
-      Ratio = (Today's Volume of THAT exact 15m slot) / (100-Day Avg Volume of THAT exact 15m slot)
-    """
     symbol = opt["underlying"]
     eq_sym = opt.get("eq_symbol", "")
     fut_sym = opt.get("fut_symbol", "")
@@ -473,7 +469,7 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
     target_date = bar_ts.date()
 
     if symbol not in slot_cache or not slot_cache.get(symbol):
-        start_dt_100d = (now_ist - timedelta(days=LOOKBACK_DAYS_100D_SLOT)).replace(hour=9, minute=15, second=0, microsecond=0)
+        start_dt_100d = (now_ist - timedelta(days=160)).replace(hour=9, minute=15, second=0, microsecond=0)
         if eq_sym:
             df_hist_1m = fetch_1m_df(conn, ic, eq_sym, start_dt_100d, now_ist, conn.EXCHANGE_TYPE_NSE)
         else:
@@ -510,7 +506,6 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
         if not matching_bars.empty:
             today_slot_vol = int(round(float(matching_bars["volume"].iloc[-1])))
 
-    # Inverted: Today / 100d Avg
     if avg_100d_slot_vol > 0 and today_slot_vol > 0:
         ratio = round(float(today_slot_vol) / float(avg_100d_slot_vol), 2)
     else:
@@ -518,24 +513,8 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
 
     return ratio, avg_100d_slot_vol, today_slot_vol
 
-def passes_underlying_vol_filter(und_vol_ratio):
-    op = UNDERLYING_VOL_FILTER_OP.strip().upper()
-    if op in ("NONE", "", "OFF"):
-        return True
-    if und_vol_ratio is None:
-        return False
-    if op == "<":
-        return und_vol_ratio < UNDERLYING_VOL_RATIO_THRESHOLD
-    if op == "<=":
-        return und_vol_ratio <= UNDERLYING_VOL_RATIO_THRESHOLD
-    if op == ">":
-        return und_vol_ratio > UNDERLYING_VOL_RATIO_THRESHOLD
-    if op == ">=":
-        return und_vol_ratio >= UNDERLYING_VOL_RATIO_THRESHOLD
-    return True
-
 # ==============================================================================
-# 6. PERFECTLY ALIGNED HTML EMAIL SENDER (LARGER FONT & CLEAN COLUMNS)
+# 6. PERFECTLY ALIGNED HTML EMAIL SENDER (LARGER FONT FOR HEADERS & CELLS)
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     max_retries = 3
@@ -588,16 +567,16 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             ]
             plain_body = "\n".join(plain_lines)
 
-            # 2. Clean HTML Table (Larger Font Size & Clean Columns)
+            # 2. Clean HTML Table (15px font size for both <th> and <td> cells)
             th_html = "".join(
-                f'<th style="background-color:#1e293b;color:#ffffff;padding:10px 14px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;font-size:15px;">{h}</th>'
+                f'<th style="background-color:#1e293b;color:#ffffff;padding:10px 14px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;font-size:15px;font-weight:600;">{h}</th>'
                 for h in headers
             )
             tr_list = []
             for idx, r in enumerate(table_rows):
                 bg = "#f8fafc" if idx % 2 == 1 else "#ffffff"
                 tds = "".join(
-                    f'<td style="padding:9px 14px;border:1px solid #cbd5e1;white-space:nowrap;font-size:15px;text-align:{"right" if i >= 3 else "left"};">{cell}</td>'
+                    f'<td style="padding:9px 14px;border:1px solid #cbd5e1;white-space:nowrap;font-size:15px;color:#0f172a;text-align:{"right" if i >= 3 else "left"};">{cell}</td>'
                     for i, cell in enumerate(r)
                 )
                 tr_list.append(f'<tr style="background-color:{bg};">{tds}</tr>')
@@ -667,7 +646,7 @@ def get_expected_15m_bar_label(now_ist):
 
 def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan, slot_cache):
     print(f"\n🔎 Scanning {len(options_list)} Filtered OTM Options on 15m timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
-    start_dt_15m = (now_ist - timedelta(days=LOOKBACK_DAYS_15M)).replace(hour=9, minute=15, second=0, microsecond=0)
+    start_dt_15m = (now_ist - timedelta(days=7)).replace(hour=9, minute=15, second=0, microsecond=0)
 
     triggered_alerts = []
     latest_bar_seen = expected_bar_label or ""
@@ -694,13 +673,6 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan, s
                 und_ratio, avg100_slot, today_slot = get_underlying_respective_slot_vol_ratio(
                     conn, ic, opt, bar_ts, now_ist, slot_cache
                 )
-
-                if not passes_underlying_vol_filter(und_ratio):
-                    print(
-                        f"  ⏭️ Skipping {trd_sym} on slot {res['slot_hm']}: "
-                        f"Und Slot Vol Ratio ({und_ratio}x) did not pass {UNDERLYING_VOL_FILTER_OP} {UNDERLYING_VOL_RATIO_THRESHOLD}"
-                    )
-                    continue
 
                 alert_item = {
                     **opt,
