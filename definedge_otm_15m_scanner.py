@@ -36,7 +36,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
-BASKET_VERSION = "v8_all_slots_100d_vol"
+BASKET_VERSION = "v9_inverted_vol_clean_table"
 
 # 15m Option ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
@@ -46,15 +46,10 @@ ATR_METHOD = "SMA"  # "SMA" or "RMA"
 
 # Yesterday Trend Filter Mode for Morning Basket Harvesting:
 # "CLOSE_VS_PREV_CLOSE" -> Down Day = Yesterday Close < Day-Before Close | Up Day = Yesterday Close > Day-Before Close
-# "CLOSE_VS_OPEN"       -> Down Day = Yesterday Close < Yesterday Open   | Up Day = Yesterday Close > Yesterday Open
 YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
 
 # Underlying Security Respective 15m Slot Volume Ratio Filter:
-# Formula: (100-Day Avg Volume of that exact 15m slot) / (Today's Volume of that exact 15m slot)
-# Set UNDERLYING_VOL_FILTER_OP to:
-#   "NONE" -> Keep all matches and display the slot ratio in the email table
-#   "<"    -> Keep only if (100d Slot Avg / Today Slot Vol) < UNDERLYING_VOL_RATIO_THRESHOLD
-#   ">"    -> Keep only if (100d Slot Avg / Today Slot Vol) > UNDERLYING_VOL_RATIO_THRESHOLD
+# Formula: (Today's Slot Volume) / (100-Day Avg Volume of that exact 15m slot)
 UNDERLYING_VOL_FILTER_OP = "NONE"
 UNDERLYING_VOL_RATIO_THRESHOLD = 1.0
 LOOKBACK_DAYS_100D_SLOT = 160  # ~160 calendar days covers 100+ trading days
@@ -82,7 +77,7 @@ high_beta_50_stocks = [
 ]
 
 # ==============================================================================
-# 2. PERSISTENT MEMORY MANAGEMENT (REAL-TIME SYNC TO otm-15m-memory-state)
+# 2. PERSISTENT MEMORY MANAGEMENT
 # ==============================================================================
 def default_memory():
     return {
@@ -110,7 +105,6 @@ def load_memory():
         return default_memory()
 
 def push_memory_to_git():
-    """Immediately persists otm_15m_memory.json to otm-15m-memory-state without touching main."""
     if not os.environ.get("GITHUB_ACTIONS"):
         return
     try:
@@ -146,7 +140,6 @@ def login_definedge():
     return conn, IntegrateData(conn)
 
 def with_connection_retry(func, *args, **kwargs):
-    """Wraps Definedge API calls with automatic re-login on connection drops."""
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
@@ -207,7 +200,6 @@ def load_master_data(conn):
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
-    # 1. Extract NSE Cash Equity (EQ) trading symbols for 100-day underlying slot volume
     nse_eq = df[
         (df[0] == "NSE")
         & (df[2].str.strip().isin(stock_set))
@@ -215,7 +207,6 @@ def load_master_data(conn):
     ].copy()
     eq_map = {row[2].strip(): row[3].strip() for _, row in nse_eq.iterrows()}
 
-    # 2. Extract NFO Futures & Options
     nfo = df[(df[0] == "NFO") & (df[2].str.strip().isin(stock_set))].copy()
     nfo[2] = nfo[2].str.strip()
     nfo[3] = nfo[3].str.strip()
@@ -364,10 +355,6 @@ def build_basket_task(conn, ic, now_ist):
                 selected_opt["eq_symbol"] = eq_map.get(symbol, "")
                 selected_opt["fut_symbol"] = fut_info["trading_symbol"]
                 basket.append(selected_opt)
-                print(
-                    f"  ✅ {symbol} (Yest: {yest_pct:+.2f}% {yest_dir} | Fut: {ref_price:.2f}) -> "
-                    f"{selected_opt['trading_symbol']}"
-                )
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
 
@@ -375,7 +362,7 @@ def build_basket_task(conn, ic, now_ist):
     return basket
 
 # ==============================================================================
-# 5. 15-MINUTE RESAMPLING, ATR(2), OPT VOL & UNDERLYING RESPECTIVE SLOT VOL
+# 5. 15-MINUTE RESAMPLING, ATR(2), OPT VOL & INVERTED UNDERLYING SLOT VOL
 # ==============================================================================
 def resample_to_15m(df_1m, now_ist):
     df = df_1m.copy().between_time("09:15", "15:29")
@@ -462,7 +449,6 @@ def evaluate_15m_option_breakout(df_15m):
 
     atr_ratio = round(cur_atr / prev_atr, 2)
     vol_ratio = round(cur_vol / prev_vol, 2)
-    gain_pct = round(((float(cur_bar["close"]) - float(prev_bar["close"])) / float(prev_bar["close"])) * 100.0, 2)
 
     return {
         "bar_ts": cur_bar.name,
@@ -470,23 +456,15 @@ def evaluate_15m_option_breakout(df_15m):
         "bar_iso": cur_bar.name.strftime("%Y-%m-%d %H:%M"),
         "slot_hm": cur_bar.name.strftime("%H:%M"),
         "close": round(float(cur_bar["close"]), 2),
-        "prev_close": round(float(prev_bar["close"]), 2),
-        "prev_high": round(float(prev_bar["high"]), 2),
-        "atr2": round(cur_atr, 2),
-        "prev_atr2": round(prev_atr, 2),
         "atr_ratio": atr_ratio,
         "vol": int(cur_vol),
-        "prev_vol": int(prev_vol),
-        "vol_ratio": vol_ratio,
-        "gain_pct": gain_pct
+        "vol_ratio": vol_ratio
     }
 
 def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slot_cache):
     """
-    Calculates the Underlying Security's Respective 15m Slot Volume Ratio for the exact bar_ts slot
-    (e.g., 1st slot 09:15, 2nd slot 09:30, 3rd slot 09:45 ... 25th slot 15:15):
-      Ratio = (100-Day Avg Volume of THAT exact 15m slot) / (Today's Volume of THAT exact 15m slot)
-    Caches the 25 historical 100-day slot averages per stock for instant reuse across the day.
+    Calculates Inverted Underlying Slot Volume Ratio:
+      Ratio = (Today's Volume of THAT exact 15m slot) / (100-Day Avg Volume of THAT exact 15m slot)
     """
     symbol = opt["underlying"]
     eq_sym = opt.get("eq_symbol", "")
@@ -494,7 +472,6 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
     slot_hm = bar_ts.strftime("%H:%M")
     target_date = bar_ts.date()
 
-    # 1. Build & cache all 25 historical 100-day 15m slot averages for this stock if not cached yet
     if symbol not in slot_cache or not slot_cache.get(symbol):
         start_dt_100d = (now_ist - timedelta(days=LOOKBACK_DAYS_100D_SLOT)).replace(hour=9, minute=15, second=0, microsecond=0)
         if eq_sym:
@@ -517,7 +494,6 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
 
     avg_100d_slot_vol = int(slot_cache.get(symbol, {}).get(slot_hm, 0))
 
-    # 2. Fetch Today's exact 15m slot volume for the underlying security
     start_today = IST.localize(datetime.combine(target_date, dtime(9, 15)))
     if eq_sym:
         df_today_1m = fetch_1m_df(conn, ic, eq_sym, start_today, now_ist, conn.EXCHANGE_TYPE_NSE)
@@ -534,8 +510,9 @@ def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slo
         if not matching_bars.empty:
             today_slot_vol = int(round(float(matching_bars["volume"].iloc[-1])))
 
+    # Inverted: Today / 100d Avg
     if avg_100d_slot_vol > 0 and today_slot_vol > 0:
-        ratio = round(float(avg_100d_slot_vol) / float(today_slot_vol), 2)
+        ratio = round(float(today_slot_vol) / float(avg_100d_slot_vol), 2)
     else:
         ratio = None
 
@@ -558,7 +535,7 @@ def passes_underlying_vol_filter(und_vol_ratio):
     return True
 
 # ==============================================================================
-# 6. PERFECTLY ALIGNED HTML + PLAIN-TEXT EMAIL ALERT SENDER
+# 6. PERFECTLY ALIGNED HTML EMAIL SENDER (LARGER FONT & CLEAN COLUMNS)
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     max_retries = 3
@@ -579,32 +556,22 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             headers = [
                 "Stock (Yest %)",
                 "Option Symbol",
-                "Type",
                 "15m Slot",
                 "Close",
-                "-1 High",
-                "ATR(2)",
-                "-1 ATR(2)",
                 "ATR Ratio",
                 "Opt Vol Ratio",
-                "Und Slot Vol Ratio (100dAvg/Slot)",
-                "Bar % Gain"
+                "Und Slot Vol Ratio (Today/100dAvg)"
             ]
 
             table_rows = [
                 [
                     f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
                     m["trading_symbol"],
-                    f"{m['opt_type']} ({m['strike']:g})",
                     m["slot_hm"],
                     f"{m['close']:.2f}",
-                    f"{m['prev_high']:.2f}",
-                    f"{m['atr2']:.2f}",
-                    f"{m['prev_atr2']:.2f}",
                     f"{m['atr_ratio']:.2f}x",
                     f"{m['vol_ratio']:.2f}x ({m['vol']:,})",
-                    f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_avg100_slot_vol', 0):,}/{m.get('und_today_slot_vol', 0):,})",
-                    f"+{m['gain_pct']:.2f}%"
+                    f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_today_slot_vol', 0):,}/{m.get('und_avg100_slot_vol', 0):,})"
                 ]
                 for m in ordered_matches
             ]
@@ -621,38 +588,38 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             ]
             plain_body = "\n".join(plain_lines)
 
-            # 2. Clean HTML Table (Never wraps or misaligns columns on mobile/desktop)
+            # 2. Clean HTML Table (Larger Font Size & Clean Columns)
             th_html = "".join(
-                f'<th style="background-color:#1e293b;color:#ffffff;padding:7px 10px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;">{h}</th>'
+                f'<th style="background-color:#1e293b;color:#ffffff;padding:10px 14px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;font-size:15px;">{h}</th>'
                 for h in headers
             )
             tr_list = []
             for idx, r in enumerate(table_rows):
                 bg = "#f8fafc" if idx % 2 == 1 else "#ffffff"
                 tds = "".join(
-                    f'<td style="padding:6px 10px;border:1px solid #cbd5e1;white-space:nowrap;text-align:{"right" if i >= 4 else "left"};">{cell}</td>'
+                    f'<td style="padding:9px 14px;border:1px solid #cbd5e1;white-space:nowrap;font-size:15px;text-align:{"right" if i >= 3 else "left"};">{cell}</td>'
                     for i, cell in enumerate(r)
                 )
                 tr_list.append(f'<tr style="background-color:{bg};">{tds}</tr>')
 
             html_body = f"""
             <html>
-            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 13px; color: #0f172a;">
-                <p style="margin:0 0 6px 0;"><strong>⚡ 15m OTM Options Reversal Breakout Alert</strong></p>
-                <p style="margin:0 0 12px 0; color:#475569;">
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 15m OTM Options Reversal Breakout Alert</strong></p>
+                <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>15m Bar:</strong> {bar_label} &nbsp;|&nbsp;
                     <strong>Basket Size:</strong> {total_tracked} Filtered OTM Options
                 </p>
                 <p style="margin:0 0 4px 0;"><strong>📋 OTM CALLS (CE - Stock Down Yesterday) - Top 5:</strong></p>
-                <pre style="background:#f1f5f9;padding:8px;border-radius:4px;margin:0 0 10px 0;white-space:pre-wrap;">{ce_top5}</pre>
+                <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{ce_top5}</pre>
                 <p style="margin:0 0 4px 0;"><strong>📋 OTM PUTS (PE - Stock Up Yesterday) - Top 5:</strong></p>
-                <pre style="background:#f1f5f9;padding:8px;border-radius:4px;margin:0 0 10px 0;white-space:pre-wrap;">{pe_top5}</pre>
-                <p style="margin:0 0 12px 0;font-size:12px;color:#334155;">
+                <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{pe_top5}</pre>
+                <p style="margin:0 0 14px 0;font-size:14px;color:#334155;">
                     <strong>All CE ({len(ce_matches)}):</strong> {ce_all}<br>
                     <strong>All PE ({len(pe_matches)}):</strong> {pe_all}
                 </p>
                 <div style="overflow-x:auto;">
-                    <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;font-size:12px;">
+                    <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
                         <thead><tr>{th_html}</tr></thead>
                         <tbody>{"".join(tr_list)}</tbody>
                     </table>
@@ -745,7 +712,7 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan, s
                 triggered_alerts.append(alert_item)
                 print(
                     f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Slot {res['slot_hm']} | "
-                    f"Und Slot Vol Ratio [100dAvg/Slot]: {alert_item['und_vol_ratio']:.2f}x) | "
+                    f"Und Slot Vol Ratio [Today/100dAvg]: {alert_item['und_vol_ratio']:.2f}x) | "
                     f"Close: {res['close']} > -1 High: {res['prev_high']} | "
                     f"ATR(2): {res['atr2']} vs {res['prev_atr2']} ({res['atr_ratio']}x) | "
                     f"Opt Vol: {res['vol']:,} vs {res['prev_vol']:,} ({res['vol_ratio']}x)"
@@ -762,7 +729,6 @@ def run_scanner(force_scan=False):
 
     memory = load_memory()
 
-    # Clear 100-day slot volume cache at the start of a new day
     if memory.get("basket_date") != today_str:
         memory["und_slot_100d_cache"] = {}
 
