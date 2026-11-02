@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, time as dtime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from tabulate import tabulate
-from integrate import ConnectToIntegrate, IntegrateData, IntegrateOrders
+from integrate import ConnectToIntegrate, IntegrateData
 
 # Force real-time unbuffered logging in GitHub Actions console
 if hasattr(sys.stdout, "reconfigure"):
@@ -36,9 +36,9 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
 MEMORY_BRANCH = "otm-15m-memory-state"
-BASKET_VERSION = "v5_yest_filter_algo_zero"
+BASKET_VERSION = "v8_all_slots_100d_vol"
 
-# 15m ATR(2) & Volume Expansion Parameters
+# 15m Option ATR(2) & Volume Expansion Parameters
 ATR_PERIOD = 2
 ATR_MULT_THRESHOLD = 1.5
 VOL_MULT_THRESHOLD = 1.5
@@ -49,16 +49,15 @@ ATR_METHOD = "SMA"  # "SMA" or "RMA"
 # "CLOSE_VS_OPEN"       -> Down Day = Yesterday Close < Yesterday Open   | Up Day = Yesterday Close > Yesterday Open
 YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
 
-# ==============================================================================
-# LIVE ORDER EXECUTION SETTINGS (DEFINEDGE INTEGRATE ORDERS)
-# ==============================================================================
-ENABLE_LIVE_ORDERS = True          # Set True to send real BUY orders to Definedge, False for email-only
-LOTS_PER_TRADE = 1                 # Number of lots to buy per qualifying option
-MAX_ORDERS_PER_BAR = 2             # Max BUY orders per 15m candle (picks highest ATR Ratio matches first)
-MAX_ORDERS_PER_DAY = 6             # Max total BUY orders across the entire trading day
-ORDER_PRODUCT_TYPE = "INTRADAY"    # "INTRADAY" (MIS) or "NORMAL" (NRML carry-forward)
-ORDER_PRICE_TYPE = "LIMIT"         # "LIMIT" (Close + buffer%, safer for OPTSTK) or "MARKET"
-LIMIT_SLIPPAGE_PCT = 1.0           # +1.0% buffer above 15m close price when ORDER_PRICE_TYPE = "LIMIT"
+# Underlying Security Respective 15m Slot Volume Ratio Filter:
+# Formula: (100-Day Avg Volume of that exact 15m slot) / (Today's Volume of that exact 15m slot)
+# Set UNDERLYING_VOL_FILTER_OP to:
+#   "NONE" -> Keep all matches and display the slot ratio in the email table
+#   "<"    -> Keep only if (100d Slot Avg / Today Slot Vol) < UNDERLYING_VOL_RATIO_THRESHOLD
+#   ">"    -> Keep only if (100d Slot Avg / Today Slot Vol) > UNDERLYING_VOL_RATIO_THRESHOLD
+UNDERLYING_VOL_FILTER_OP = "NONE"
+UNDERLYING_VOL_RATIO_THRESHOLD = 1.0
+LOOKBACK_DAYS_100D_SLOT = 160  # ~160 calendar days covers 100+ trading days
 
 LOOKBACK_DAYS_15M = 7
 MIN_DAYS_TO_EXPIRY = 0  # 0 = current active monthly expiry
@@ -91,7 +90,7 @@ def default_memory():
         "basket_is_live": False,
         "basket_version": "",
         "last_scanned_15m_bar": "",
-        "orders_placed_today": [],
+        "und_slot_100d_cache": {},
         "options": []
     }
 
@@ -103,8 +102,8 @@ def load_memory():
             data = json.load(f)
             if "options" not in data:
                 return default_memory()
-            if "orders_placed_today" not in data:
-                data["orders_placed_today"] = []
+            if "und_slot_100d_cache" not in data:
+                data["und_slot_100d_cache"] = {}
             return data
     except Exception as e:
         print(f"⚠️ Could not read {MEMORY_FILE}, starting fresh: {e}")
@@ -160,7 +159,7 @@ def with_connection_retry(func, *args, **kwargs):
             time.sleep(5)
 
 # ==============================================================================
-# 4. MASTER SYMBOL PARSING & FILTERED BASKET BUILDER (DOWN YEST -> CE | UP YEST -> PE)
+# 4. MASTER SYMBOL PARSING & FILTERED BASKET BUILDER
 # ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
@@ -194,7 +193,7 @@ def extract_strike_and_type_from_row(row, underlying, trading_symbol):
         return strike, opt_type
     return None, None
 
-def load_nfo_master_data(conn):
+def load_master_data(conn):
     today = datetime.now(IST).date()
     min_expiry = today + timedelta(days=MIN_DAYS_TO_EXPIRY)
     stock_set = set(high_beta_50_stocks)
@@ -208,6 +207,15 @@ def load_nfo_master_data(conn):
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
+    # 1. Extract NSE Cash Equity (EQ) trading symbols for 100-day underlying slot volume
+    nse_eq = df[
+        (df[0] == "NSE")
+        & (df[2].str.strip().isin(stock_set))
+        & (df[4].str.strip() == "EQ")
+    ].copy()
+    eq_map = {row[2].strip(): row[3].strip() for _, row in nse_eq.iterrows()}
+
+    # 2. Extract NFO Futures & Options
     nfo = df[(df[0] == "NFO") & (df[2].str.strip().isin(stock_set))].copy()
     nfo[2] = nfo[2].str.strip()
     nfo[3] = nfo[3].str.strip()
@@ -234,26 +242,21 @@ def load_nfo_master_data(conn):
         und = row[2]
         trd_sym = row[3]
         strike, opt_type = extract_strike_and_type_from_row(row, und, trd_sym)
-        try:
-            lot_size = int(float(row[7])) if (7 in row.index and pd.notna(row[7]) and float(row[7]) > 0) else 1
-        except Exception:
-            lot_size = 1
-
         if strike is not None and opt_type in ("CE", "PE"):
             options_by_stock[und].append({
                 "underlying": und,
                 "trading_symbol": trd_sym,
                 "strike": strike,
                 "opt_type": opt_type,
-                "lot_size": lot_size,
                 "expiry": str(row["expiry"])
             })
 
-    return fut_map, options_by_stock
+    return eq_map, fut_map, options_by_stock
 
-def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt):
+def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt, exchange_type=None):
+    exch = exchange_type if exchange_type is not None else conn.EXCHANGE_TYPE_NFO
     hist = ic.historical_data(
-        exchange=conn.EXCHANGE_TYPE_NFO,
+        exchange=exch,
         trading_symbol=trading_symbol,
         timeframe=conn.TIMEFRAME_TYPE_MIN,
         start=start_dt,
@@ -275,8 +278,8 @@ def fetch_1m_df(conn, ic, trading_symbol, start_dt, end_dt):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
-def get_yesterday_direction(df_fut_1m, today_date):
-    df_prev = df_fut_1m[df_fut_1m.index.date < today_date].between_time("09:15", "15:29")
+def get_yesterday_direction(df_1m, today_date):
+    df_prev = df_1m[df_1m.index.date < today_date].between_time("09:15", "15:29")
     if df_prev.empty:
         return "FLAT", 0.0
 
@@ -309,10 +312,10 @@ def get_yesterday_direction(df_fut_1m, today_date):
 def build_basket_task(conn, ic, now_ist):
     print(
         f"\n🎯 Building Filtered OTM Option Basket for {len(high_beta_50_stocks)} High-Beta Stocks "
-        f"(Down Yesterday -> OTM CE | Up Yesterday -> OTM PE | Mode: {YESTERDAY_TREND_MODE})..."
+        f"(Down Yesterday -> OTM CE | Up Yesterday -> OTM PE)..."
     )
-    fut_map, options_by_stock = load_nfo_master_data(conn)
-    start_dt = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
+    eq_map, fut_map, options_by_stock = load_master_data(conn)
+    start_dt_fut = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
     today_date = now_ist.date()
 
     basket = []
@@ -326,24 +329,23 @@ def build_basket_task(conn, ic, now_ist):
             continue
 
         try:
-            df_fut = fetch_1m_df(conn, ic, fut_info["trading_symbol"], start_dt, now_ist)
+            df_fut = fetch_1m_df(conn, ic, fut_info["trading_symbol"], start_dt_fut, now_ist, conn.EXCHANGE_TYPE_NFO)
             if df_fut.empty:
                 continue
 
             ref_price = float(df_fut["close"].iloc[-1])
             yest_dir, yest_pct = get_yesterday_direction(df_fut, today_date)
+            if yest_dir not in ("DOWN", "UP"):
+                continue
 
+            selected_opt = None
             if yest_dir == "DOWN":
                 ce_candidates = sorted(
                     [o for o in opt_chain if o["opt_type"] == "CE" and o["strike"] > ref_price],
                     key=lambda x: x["strike"]
                 )
                 if ce_candidates:
-                    otm_ce = dict(ce_candidates[0])
-                    otm_ce["ref_fut_price"] = round(ref_price, 2)
-                    otm_ce["yest_dir"] = "DOWN"
-                    otm_ce["yest_pct"] = yest_pct
-                    basket.append(otm_ce)
+                    selected_opt = dict(ce_candidates[0])
                     ce_count += 1
             elif yest_dir == "UP":
                 pe_candidates = sorted(
@@ -352,12 +354,20 @@ def build_basket_task(conn, ic, now_ist):
                     reverse=True
                 )
                 if pe_candidates:
-                    otm_pe = dict(pe_candidates[0])
-                    otm_pe["ref_fut_price"] = round(ref_price, 2)
-                    otm_pe["yest_dir"] = "UP"
-                    otm_pe["yest_pct"] = yest_pct
-                    basket.append(otm_pe)
+                    selected_opt = dict(pe_candidates[0])
                     pe_count += 1
+
+            if selected_opt:
+                selected_opt["ref_fut_price"] = round(ref_price, 2)
+                selected_opt["yest_dir"] = yest_dir
+                selected_opt["yest_pct"] = yest_pct
+                selected_opt["eq_symbol"] = eq_map.get(symbol, "")
+                selected_opt["fut_symbol"] = fut_info["trading_symbol"]
+                basket.append(selected_opt)
+                print(
+                    f"  ✅ {symbol} (Yest: {yest_pct:+.2f}% {yest_dir} | Fut: {ref_price:.2f}) -> "
+                    f"{selected_opt['trading_symbol']}"
+                )
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
 
@@ -365,7 +375,7 @@ def build_basket_task(conn, ic, now_ist):
     return basket
 
 # ==============================================================================
-# 5. 15-MINUTE RESAMPLING, ATR(2) & VOLUME BREAKOUT LOGIC
+# 5. 15-MINUTE RESAMPLING, ATR(2), OPT VOL & UNDERLYING RESPECTIVE SLOT VOL
 # ==============================================================================
 def resample_to_15m(df_1m, now_ist):
     df = df_1m.copy().between_time("09:15", "15:29")
@@ -455,8 +465,10 @@ def evaluate_15m_option_breakout(df_15m):
     gain_pct = round(((float(cur_bar["close"]) - float(prev_bar["close"])) / float(prev_bar["close"])) * 100.0, 2)
 
     return {
+        "bar_ts": cur_bar.name,
         "bar_time": cur_bar.name.strftime("%d-%b %H:%M"),
         "bar_iso": cur_bar.name.strftime("%Y-%m-%d %H:%M"),
+        "slot_hm": cur_bar.name.strftime("%H:%M"),
         "close": round(float(cur_bar["close"]), 2),
         "prev_close": round(float(prev_bar["close"]), 2),
         "prev_high": round(float(prev_bar["high"]), 2),
@@ -469,124 +481,114 @@ def evaluate_15m_option_breakout(df_15m):
         "gain_pct": gain_pct
     }
 
-# ==============================================================================
-# 6. LIVE DEFINEDGE ORDER EXECUTION (IntegrateOrders with algo_id="0")
-# ==============================================================================
-def round_to_tick(price, tick=0.05):
-    return round(round(price / tick) * tick, 2)
+def get_underlying_respective_slot_vol_ratio(conn, ic, opt, bar_ts, now_ist, slot_cache):
+    """
+    Calculates the Underlying Security's Respective 15m Slot Volume Ratio for the exact bar_ts slot
+    (e.g., 1st slot 09:15, 2nd slot 09:30, 3rd slot 09:45 ... 25th slot 15:15):
+      Ratio = (100-Day Avg Volume of THAT exact 15m slot) / (Today's Volume of THAT exact 15m slot)
+    Caches the 25 historical 100-day slot averages per stock for instant reuse across the day.
+    """
+    symbol = opt["underlying"]
+    eq_sym = opt.get("eq_symbol", "")
+    fut_sym = opt.get("fut_symbol", "")
+    slot_hm = bar_ts.strftime("%H:%M")
+    target_date = bar_ts.date()
 
-def execute_buy_orders_for_matches(triggered_list, memory):
-    is_live_market = dtime(9, 15) <= datetime.now(IST).time() <= dtime(15, 29, 50)
-    orders_today = memory.get("orders_placed_today", [])
-
-    ranked_matches = sorted(triggered_list, key=lambda x: x["atr_ratio"], reverse=True)
-
-    if not ENABLE_LIVE_ORDERS:
-        for m in ranked_matches:
-            m["order_info"] = "⏸️ Disabled"
-        return ranked_matches
-
-    if not is_live_market:
-        for m in ranked_matches:
-            m["order_info"] = "⏹️ After-Hours"
-        return ranked_matches
-
-    try:
-        conn, _ = login_definedge()
-        io_client = IntegrateOrders(conn)
-    except Exception as e:
-        print(f"⚠️ Could not initialize IntegrateOrders: {e}")
-        for m in ranked_matches:
-            m["order_info"] = "❌ Login Err"
-        return ranked_matches
-
-    orders_sent_this_bar = 0
-    for m in ranked_matches:
-        trd_sym = m["trading_symbol"]
-        lot_size = int(m.get("lot_size", 1))
-        qty = lot_size * LOTS_PER_TRADE
-
-        if trd_sym in orders_today:
-            m["order_info"] = "⏭️ Already Bought"
-            continue
-
-        if len(orders_today) >= MAX_ORDERS_PER_DAY:
-            m["order_info"] = f"⏭️ Daily Cap"
-            continue
-
-        if orders_sent_this_bar >= MAX_ORDERS_PER_BAR:
-            m["order_info"] = f"⏭️ Bar Cap"
-            continue
-
-        prod_type = (
-            getattr(conn, "PRODUCT_TYPE_NORMAL", "M")
-            if ORDER_PRODUCT_TYPE.upper() == "NORMAL"
-            else getattr(conn, "PRODUCT_TYPE_INTRADAY", "I")
-        )
-
-        if ORDER_PRICE_TYPE.upper() == "MARKET":
-            p_type = getattr(conn, "PRICE_TYPE_MARKET", "MKT")
-            order_price = 0
+    # 1. Build & cache all 25 historical 100-day 15m slot averages for this stock if not cached yet
+    if symbol not in slot_cache or not slot_cache.get(symbol):
+        start_dt_100d = (now_ist - timedelta(days=LOOKBACK_DAYS_100D_SLOT)).replace(hour=9, minute=15, second=0, microsecond=0)
+        if eq_sym:
+            df_hist_1m = fetch_1m_df(conn, ic, eq_sym, start_dt_100d, now_ist, conn.EXCHANGE_TYPE_NSE)
         else:
-            p_type = getattr(conn, "PRICE_TYPE_LIMIT", "LMT")
-            buffered_price = float(m["close"]) * (1.0 + (LIMIT_SLIPPAGE_PCT / 100.0))
-            order_price = round_to_tick(buffered_price, 0.05)
+            df_hist_1m = fetch_1m_df(conn, ic, fut_sym, start_dt_100d, now_ist, conn.EXCHANGE_TYPE_NFO)
 
-        try:
-            resp = io_client.place_order(
-                exchange=conn.EXCHANGE_TYPE_NFO,
-                order_type=conn.ORDER_TYPE_BUY,
-                price=order_price,
-                price_type=p_type,
-                product_type=prod_type,
-                quantity=qty,
-                tradingsymbol=trd_sym,
-                algo_id="0"  # Fixed: Definedge requires a non-blank algo_id string like "0"
-            )
-            order_id = resp.get("order_id") or resp.get("norenordno") or resp.get("status") or "Sent"
-            status_str = str(resp.get("status", "")).upper()
+        df_hist_15m = resample_to_15m(df_hist_1m, now_ist)
+        slot_avgs = {}
+        if not df_hist_15m.empty:
+            df_prior = df_hist_15m[df_hist_15m.index.date < target_date].copy()
+            df_prior = df_prior[df_prior["volume"] > 0]
+            if not df_prior.empty:
+                df_prior["slot_hm"] = df_prior.index.strftime("%H:%M")
+                for s_hm, grp in df_prior.groupby("slot_hm"):
+                    last_100 = grp["volume"].tail(100)
+                    if not last_100.empty:
+                        slot_avgs[s_hm] = int(round(float(last_100.mean())))
+        slot_cache[symbol] = slot_avgs
 
-            if status_str in ("OK", "SUCCESS") or resp.get("order_id"):
-                orders_sent_this_bar += 1
-                orders_today.append(trd_sym)
-                m["order_info"] = f"✅ BUY {qty} @ {order_price or 'MKT'} (ID:{order_id})"
-                print(f"  🛒 ORDER PLACED: {trd_sym} | Qty: {qty} | Price: {order_price or 'MKT'} | Resp: {resp}")
-            else:
-                msg = resp.get("message") or resp.get("emsg") or str(resp)
-                m["order_info"] = f"⚠️ {str(msg)[:28]}"
-                print(f"  ⚠️ ORDER REJECTED for {trd_sym}: {resp}")
-        except Exception as e:
-            m["order_info"] = f"❌ Err: {str(e)[:22]}"
-            print(f"  ❌ Order placement exception for {trd_sym}: {e}")
+    avg_100d_slot_vol = int(slot_cache.get(symbol, {}).get(slot_hm, 0))
 
-    memory["orders_placed_today"] = orders_today
-    return ranked_matches
+    # 2. Fetch Today's exact 15m slot volume for the underlying security
+    start_today = IST.localize(datetime.combine(target_date, dtime(9, 15)))
+    if eq_sym:
+        df_today_1m = fetch_1m_df(conn, ic, eq_sym, start_today, now_ist, conn.EXCHANGE_TYPE_NSE)
+    else:
+        df_today_1m = fetch_1m_df(conn, ic, fut_sym, start_today, now_ist, conn.EXCHANGE_TYPE_NFO)
+
+    df_today_15m = resample_to_15m(df_today_1m, now_ist)
+    today_slot_vol = 0
+    if not df_today_15m.empty:
+        matching_bars = df_today_15m[
+            (df_today_15m.index.date == target_date)
+            & (df_today_15m.index.strftime("%H:%M") == slot_hm)
+        ]
+        if not matching_bars.empty:
+            today_slot_vol = int(round(float(matching_bars["volume"].iloc[-1])))
+
+    if avg_100d_slot_vol > 0 and today_slot_vol > 0:
+        ratio = round(float(avg_100d_slot_vol) / float(today_slot_vol), 2)
+    else:
+        ratio = None
+
+    return ratio, avg_100d_slot_vol, today_slot_vol
+
+def passes_underlying_vol_filter(und_vol_ratio):
+    op = UNDERLYING_VOL_FILTER_OP.strip().upper()
+    if op in ("NONE", "", "OFF"):
+        return True
+    if und_vol_ratio is None:
+        return False
+    if op == "<":
+        return und_vol_ratio < UNDERLYING_VOL_RATIO_THRESHOLD
+    if op == "<=":
+        return und_vol_ratio <= UNDERLYING_VOL_RATIO_THRESHOLD
+    if op == ">":
+        return und_vol_ratio > UNDERLYING_VOL_RATIO_THRESHOLD
+    if op == ">=":
+        return und_vol_ratio >= UNDERLYING_VOL_RATIO_THRESHOLD
+    return True
 
 # ==============================================================================
-# 7. EMAIL ALERT SENDER WITH ORDER EXECUTION REPORT
+# 6. PERFECTLY ALIGNED HTML + PLAIN-TEXT EMAIL ALERT SENDER
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-            subject = f"⚡ 15m OTM Options Breakout + Orders ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+            subject = f"⚡ 15m OTM Options Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
             ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=lambda x: x["atr_ratio"], reverse=True)
             pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=lambda x: x["atr_ratio"], reverse=True)
+            ordered_matches = ce_matches + pe_matches
 
             ce_top5 = ", ".join([m["trading_symbol"] for m in ce_matches[:5]]) or "None"
             pe_top5 = ", ".join([m["trading_symbol"] for m in pe_matches[:5]]) or "None"
             ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
             pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
-            body_lines = [
-                f"15m OTM Options Reversal Alert (Down Yest -> CE | Up Yest -> PE | ATR(2) > 1.5x | Vol > 1.5x)",
-                f"15m Bar: {bar_label} | Basket Size: {total_tracked} Filtered OTM Options\n",
-                f"📋 OTM CALLS (CE - Stock Down Yesterday) - Top 5:\n{ce_top5}\n",
-                f"📋 OTM PUTS (PE - Stock Up Yesterday) - Top 5:\n{pe_top5}\n",
-                f"All CE ({len(ce_matches)}): {ce_all}",
-                f"All PE ({len(pe_matches)}): {pe_all}\n"
+            headers = [
+                "Stock (Yest %)",
+                "Option Symbol",
+                "Type",
+                "15m Slot",
+                "Close",
+                "-1 High",
+                "ATR(2)",
+                "-1 ATR(2)",
+                "ATR Ratio",
+                "Opt Vol Ratio",
+                "Und Slot Vol Ratio (100dAvg/Slot)",
+                "Bar % Gain"
             ]
 
             table_rows = [
@@ -594,26 +596,77 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                     f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
                     m["trading_symbol"],
                     f"{m['opt_type']} ({m['strike']:g})",
-                    m["close"],
-                    m["prev_high"],
-                    f"{m['atr_ratio']}x",
-                    f"{m['vol_ratio']}x ({m['vol']:,})",
-                    f"+{m['gain_pct']}%",
-                    m.get("order_info", "N/A")
+                    m["slot_hm"],
+                    f"{m['close']:.2f}",
+                    f"{m['prev_high']:.2f}",
+                    f"{m['atr2']:.2f}",
+                    f"{m['prev_atr2']:.2f}",
+                    f"{m['atr_ratio']:.2f}x",
+                    f"{m['vol_ratio']:.2f}x ({m['vol']:,})",
+                    f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_avg100_slot_vol', 0):,}/{m.get('und_today_slot_vol', 0):,})",
+                    f"+{m['gain_pct']:.2f}%"
                 ]
-                for m in (ce_matches + pe_matches)
+                for m in ordered_matches
             ]
-            headers = [
-                "Stock (Yest %)", "Option Symbol", "Type",
-                "Close", "-1 High", "ATR Ratio", "Vol Ratio (Vol)", "Bar %", "Definedge Order Status"
-            ]
-            body_lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
 
-            msg = MIMEMultipart()
+            # 1. Plain-text fallback
+            plain_lines = [
+                "15m OTM Options Reversal Alert (Down Yest -> CE | Up Yest -> PE | ATR(2) > 1.5x | Opt Vol > 1.5x)",
+                f"15m Bar: {bar_label} | Basket Size: {total_tracked} Filtered OTM Options\n",
+                f"OTM CALLS (CE) - Top 5:\n{ce_top5}\n",
+                f"OTM PUTS (PE) - Top 5:\n{pe_top5}\n",
+                f"All CE ({len(ce_matches)}): {ce_all}",
+                f"All PE ({len(pe_matches)}): {pe_all}\n",
+                tabulate(table_rows, headers=headers, tablefmt="simple")
+            ]
+            plain_body = "\n".join(plain_lines)
+
+            # 2. Clean HTML Table (Never wraps or misaligns columns on mobile/desktop)
+            th_html = "".join(
+                f'<th style="background-color:#1e293b;color:#ffffff;padding:7px 10px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;">{h}</th>'
+                for h in headers
+            )
+            tr_list = []
+            for idx, r in enumerate(table_rows):
+                bg = "#f8fafc" if idx % 2 == 1 else "#ffffff"
+                tds = "".join(
+                    f'<td style="padding:6px 10px;border:1px solid #cbd5e1;white-space:nowrap;text-align:{"right" if i >= 4 else "left"};">{cell}</td>'
+                    for i, cell in enumerate(r)
+                )
+                tr_list.append(f'<tr style="background-color:{bg};">{tds}</tr>')
+
+            html_body = f"""
+            <html>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 13px; color: #0f172a;">
+                <p style="margin:0 0 6px 0;"><strong>⚡ 15m OTM Options Reversal Breakout Alert</strong></p>
+                <p style="margin:0 0 12px 0; color:#475569;">
+                    <strong>15m Bar:</strong> {bar_label} &nbsp;|&nbsp;
+                    <strong>Basket Size:</strong> {total_tracked} Filtered OTM Options
+                </p>
+                <p style="margin:0 0 4px 0;"><strong>📋 OTM CALLS (CE - Stock Down Yesterday) - Top 5:</strong></p>
+                <pre style="background:#f1f5f9;padding:8px;border-radius:4px;margin:0 0 10px 0;white-space:pre-wrap;">{ce_top5}</pre>
+                <p style="margin:0 0 4px 0;"><strong>📋 OTM PUTS (PE - Stock Up Yesterday) - Top 5:</strong></p>
+                <pre style="background:#f1f5f9;padding:8px;border-radius:4px;margin:0 0 10px 0;white-space:pre-wrap;">{pe_top5}</pre>
+                <p style="margin:0 0 12px 0;font-size:12px;color:#334155;">
+                    <strong>All CE ({len(ce_matches)}):</strong> {ce_all}<br>
+                    <strong>All PE ({len(pe_matches)}):</strong> {pe_all}
+                </p>
+                <div style="overflow-x:auto;">
+                    <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;font-size:12px;">
+                        <thead><tr>{th_html}</tr></thead>
+                        <tbody>{"".join(tr_list)}</tbody>
+                    </table>
+                </div>
+            </body>
+            </html>
+            """
+
+            msg = MIMEMultipart("alternative")
             msg["From"] = SENDER_EMAIL
             msg["To"] = RECEIVER_EMAIL
             msg["Subject"] = subject
-            msg.attach(MIMEText("\n".join(body_lines), "plain"))
+            msg.attach(MIMEText(plain_body, "plain"))
+            msg.attach(MIMEText(html_body, "html"))
 
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(SENDER_EMAIL, APP_PASSWORD)
@@ -629,7 +682,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                 time.sleep(3)
 
 # ==============================================================================
-# 8. MAIN RUNNER WITH CONNECTION RETRY WRAPPER
+# 7. MAIN RUNNER WITH CONNECTION RETRY WRAPPER
 # ==============================================================================
 def get_expected_15m_bar_label(now_ist):
     t = now_ist.time()
@@ -645,7 +698,7 @@ def get_expected_15m_bar_label(now_ist):
         bar_start = now_ist.replace(hour=bar_start_mins // 60, minute=bar_start_mins % 60, second=0, microsecond=0)
     return bar_start.strftime("%Y-%m-%d %H:%M")
 
-def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
+def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan, slot_cache):
     print(f"\n🔎 Scanning {len(options_list)} Filtered OTM Options on 15m timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
     start_dt_15m = (now_ist - timedelta(days=LOOKBACK_DAYS_15M)).replace(hour=9, minute=15, second=0, microsecond=0)
 
@@ -655,7 +708,7 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
     for opt in options_list:
         trd_sym = opt["trading_symbol"]
         try:
-            df_1m = fetch_1m_df(conn, ic, trd_sym, start_dt_15m, now_ist)
+            df_1m = fetch_1m_df(conn, ic, trd_sym, start_dt_15m, now_ist, conn.EXCHANGE_TYPE_NFO)
             if df_1m.empty:
                 continue
 
@@ -670,13 +723,32 @@ def scan_task(conn, ic, options_list, expected_bar_label, now_ist, force_scan):
                 if expected_bar_label and res["bar_iso"] != expected_bar_label and not force_scan:
                     continue
 
-                alert_item = {**opt, **res}
+                bar_ts = res.pop("bar_ts")
+                und_ratio, avg100_slot, today_slot = get_underlying_respective_slot_vol_ratio(
+                    conn, ic, opt, bar_ts, now_ist, slot_cache
+                )
+
+                if not passes_underlying_vol_filter(und_ratio):
+                    print(
+                        f"  ⏭️ Skipping {trd_sym} on slot {res['slot_hm']}: "
+                        f"Und Slot Vol Ratio ({und_ratio}x) did not pass {UNDERLYING_VOL_FILTER_OP} {UNDERLYING_VOL_RATIO_THRESHOLD}"
+                    )
+                    continue
+
+                alert_item = {
+                    **opt,
+                    **res,
+                    "und_vol_ratio": und_ratio if und_ratio is not None else 0.0,
+                    "und_avg100_slot_vol": avg100_slot,
+                    "und_today_slot_vol": today_slot
+                }
                 triggered_alerts.append(alert_item)
                 print(
-                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Lot: {opt.get('lot_size', 1)} | Yest: {opt.get('yest_pct', 0):+.1f}%) on {res['bar_time']} | "
+                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Slot {res['slot_hm']} | "
+                    f"Und Slot Vol Ratio [100dAvg/Slot]: {alert_item['und_vol_ratio']:.2f}x) | "
                     f"Close: {res['close']} > -1 High: {res['prev_high']} | "
                     f"ATR(2): {res['atr2']} vs {res['prev_atr2']} ({res['atr_ratio']}x) | "
-                    f"Vol: {res['vol']:,} vs {res['prev_vol']:,} ({res['vol_ratio']}x)"
+                    f"Opt Vol: {res['vol']:,} vs {res['prev_vol']:,} ({res['vol_ratio']}x)"
                 )
         except Exception as e:
             print(f"  ⚠️ Error scanning {trd_sym}: {e}")
@@ -690,8 +762,9 @@ def run_scanner(force_scan=False):
 
     memory = load_memory()
 
+    # Clear 100-day slot volume cache at the start of a new day
     if memory.get("basket_date") != today_str:
-        memory["orders_placed_today"] = []
+        memory["und_slot_100d_cache"] = {}
 
     need_new_basket = (
         memory.get("basket_date") != today_str
@@ -721,25 +794,26 @@ def run_scanner(force_scan=False):
             print(f"ℹ️ 15m bar [{expected_bar_label}] already scanned. Skipping duplicate check.")
             return
 
+    slot_cache = memory.get("und_slot_100d_cache", {})
     triggered_alerts, latest_bar_seen = with_connection_retry(
-        scan_task, options_list, expected_bar_label, now_ist, force_scan
+        scan_task, options_list, expected_bar_label, now_ist, force_scan, slot_cache
     )
+    memory["und_slot_100d_cache"] = slot_cache
 
     if expected_bar_label:
         memory["last_scanned_15m_bar"] = expected_bar_label
     elif latest_bar_seen:
         memory["last_scanned_15m_bar"] = latest_bar_seen
 
+    save_memory(memory)
+
     if triggered_alerts:
-        triggered_alerts = execute_buy_orders_for_matches(triggered_alerts, memory)
-        save_memory(memory)
         send_otm_15m_email_alert(triggered_alerts, latest_bar_seen, len(options_list))
     else:
-        save_memory(memory)
         print(f"ℹ️ No 15m OTM Options matched the ATR(2) + Vol breakout criteria on bar [{latest_bar_seen}].")
 
 # ==============================================================================
-# 9. FULL-DAY CHAINED MARKET CLOCK WITH HEARTBEAT SLEEP
+# 8. FULL-DAY CHAINED MARKET CLOCK WITH HEARTBEAT SLEEP
 # ==============================================================================
 SCAN_CHECKPOINTS_IST = [
     dtime(9, 30, 12), dtime(9, 45, 12),
