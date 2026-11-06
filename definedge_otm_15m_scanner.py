@@ -16,15 +16,33 @@ from email.mime.multipart import MIMEMultipart
 from tabulate import tabulate
 
 # ==============================================================================
-# 1. CREDENTIALS & CONFIGURATION (GITHUB ACTIONS SECRETS)
+# 1. CREDENTIALS & CONFIGURATION (GITHUB ACTIONS SECRETS + FALLBACKS)
 # ==============================================================================
 DEFINEDGE_API_TOKEN = os.environ.get("DEFINEDGE_API_TOKEN", "").strip()
 DEFINEDGE_API_SECRET = os.environ.get("DEFINEDGE_API_SECRET", "").strip()
 DEFINEDGE_TOTP_SECRET = os.environ.get("DEFINEDGE_TOTP_SECRET", "").strip()
 
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "").strip()
-RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "").strip()
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
+SENDER_EMAIL = (
+    os.environ.get("SENDER_EMAIL")
+    or os.environ.get("EMAIL_SENDER")
+    or os.environ.get("EMAIL_USER")
+    or "balanisuresh@gmail.com"
+).strip()
+
+RECEIVER_EMAIL = (
+    os.environ.get("RECEIVER_EMAIL")
+    or os.environ.get("EMAIL_RECEIVER")
+    or SENDER_EMAIL
+    or "balanisuresh@gmail.com"
+).strip()
+
+APP_PASSWORD = (
+    os.environ.get("APP_PASSWORD")
+    or os.environ.get("EMAIL_PASSWORD")
+    or os.environ.get("GMAIL_APP_PASSWORD")
+    or os.environ.get("EMAIL_PASS")
+    or ""
+).strip()
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
@@ -478,11 +496,14 @@ def evaluate_15m_option_breakout(df_15m):
     ):
         return None
 
+    signal_ts = cur_bar.name + timedelta(minutes=15)
+
     return {
         "bar_ts": cur_bar.name,
         "bar_time": cur_bar.name.strftime("%d-%b %H:%M"),
         "bar_iso": cur_bar.name.strftime("%Y-%m-%d %H:%M"),
         "slot_hm": cur_bar.name.strftime("%H:%M"),
+        "signal_hm": signal_ts.strftime("%H:%M"),
         "close": round(float(cur_bar["close"]), 2),
         "atr_ratio": round(cur_atr / prev_atr, 2),
         "vol": int(cur_vol),
@@ -546,50 +567,55 @@ def get_underlying_respective_slot_vol_ratio(opt, bar_ts, now_ist, memory):
 # 6. 15px LARGE-FONT HTML EMAIL SENDER (SORTED BY UND SLOT VOL RATIO)
 # ==============================================================================
 def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
+    now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
+    subject = f"⚡ 15m OTM Options Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+
+    sort_key = lambda x: (x.get("und_vol_ratio", 0.0), x.get("atr_ratio", 0.0))
+    ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=sort_key, reverse=True)
+    pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=sort_key, reverse=True)
+    ordered_matches = ce_matches + pe_matches
+
+    ce_top5 = ", ".join([m["trading_symbol"] for m in ce_matches[:5]]) or "None"
+    pe_top5 = ", ".join([m["trading_symbol"] for m in pe_matches[:5]]) or "None"
+    ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
+    pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
+
+    headers = [
+        "Stock (Yest %)",
+        "Option Symbol",
+        "15m Slot (Sig)",
+        "Close",
+        "ATR Ratio",
+        "Opt Vol Ratio",
+        "Und Slot Vol Ratio (Today/100dAvg)"
+    ]
+
+    table_rows = [
+        [
+            f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
+            m["trading_symbol"],
+            f"{m['slot_hm']} ({m.get('signal_hm', '')})",
+            f"{m['close']:.2f}",
+            f"{m['atr_ratio']:.2f}x",
+            f"{m['vol_ratio']:.2f}x ({m['vol']:,})",
+            f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_today_slot_vol', 0):,}/{m.get('und_avg100_slot_vol', 0):,})"
+        ]
+        for m in ordered_matches
+    ]
+
+    plain_body = tabulate(table_rows, headers=headers, tablefmt="simple")
+    print(f"\n📊 {subject}\n{plain_body}\n")
+
     if not SENDER_EMAIL or not RECEIVER_EMAIL or not APP_PASSWORD:
-        print("⚠️ Email credentials missing. Skipping email dispatch.")
+        print(
+            f"⚠️ Email credentials check -> SENDER: {'SET' if SENDER_EMAIL else 'MISSING'} | "
+            f"RECEIVER: {'SET' if RECEIVER_EMAIL else 'MISSING'} | "
+            f"APP_PASSWORD: {'SET' if APP_PASSWORD else 'MISSING (Check workflow .yml env section)'}. Skipping email dispatch."
+        )
         return
 
     for attempt in range(1, 4):
         try:
-            now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-            subject = f"⚡ 15m OTM Options Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
-
-            sort_key = lambda x: (x.get("und_vol_ratio", 0.0), x.get("atr_ratio", 0.0))
-            ce_matches = sorted([m for m in triggered_list if m["opt_type"] == "CE"], key=sort_key, reverse=True)
-            pe_matches = sorted([m for m in triggered_list if m["opt_type"] == "PE"], key=sort_key, reverse=True)
-            ordered_matches = ce_matches + pe_matches
-
-            ce_top5 = ", ".join([m["trading_symbol"] for m in ce_matches[:5]]) or "None"
-            pe_top5 = ", ".join([m["trading_symbol"] for m in pe_matches[:5]]) or "None"
-            ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
-            pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
-
-            headers = [
-                "Stock (Yest %)",
-                "Option Symbol",
-                "15m Slot",
-                "Close",
-                "ATR Ratio",
-                "Opt Vol Ratio",
-                "Und Slot Vol Ratio (Today/100dAvg)"
-            ]
-
-            table_rows = [
-                [
-                    f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
-                    m["trading_symbol"],
-                    m["slot_hm"],
-                    f"{m['close']:.2f}",
-                    f"{m['atr_ratio']:.2f}x",
-                    f"{m['vol_ratio']:.2f}x ({m['vol']:,})",
-                    f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_today_slot_vol', 0):,}/{m.get('und_avg100_slot_vol', 0):,})"
-                ]
-                for m in ordered_matches
-            ]
-
-            plain_body = tabulate(table_rows, headers=headers, tablefmt="simple")
-
             th_html = "".join(
                 f'<th style="background-color:#1e293b;color:#ffffff;padding:10px 14px;border:1px solid #cbd5e1;text-align:left;white-space:nowrap;font-size:15px;font-weight:600;">{h}</th>'
                 for h in headers
@@ -640,7 +666,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
                 server.login(SENDER_EMAIL, APP_PASSWORD)
                 server.send_message(msg)
 
-            print(f"✅ Alert Email sent successfully for {len(triggered_list)} contract(s)!")
+            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(triggered_list)} contract(s)!")
             return
         except Exception as e:
             print(f"⚠️ Email attempt {attempt}/3 failed: {e}")
@@ -717,7 +743,8 @@ def run_scanner(force_scan=False):
             latest_bar_seen = df_15m.index[-1].strftime("%Y-%m-%d %H:%M")
 
             if res:
-                if expected_bar_label and res["bar_iso"] != expected_bar_label and not force_scan:
+                # Strict Stale-Bar Guard (Matches Dhan Cloud 1-to-1)
+                if expected_bar_label and res["bar_iso"] != expected_bar_label:
                     continue
 
                 bar_ts = res.pop("bar_ts")
@@ -732,7 +759,7 @@ def run_scanner(force_scan=False):
                 }
                 triggered_alerts.append(alert_item)
                 print(
-                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Slot {res['slot_hm']} | "
+                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Slot {res['slot_hm']} -> Sig {res['signal_hm']} | "
                     f"Und Slot Vol [Today/100dAvg]: {und_ratio:.2f}x | "
                     f"ATR Ratio: {res['atr_ratio']}x | Opt Vol: {res['vol_ratio']}x)"
                 )
