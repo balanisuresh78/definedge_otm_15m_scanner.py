@@ -47,7 +47,7 @@ APP_PASSWORD = (
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "volume_alert_memory.json"
 
-VELOCITY_MULT_THRESHOLD = 2.0  # Fires if current speed is >= 2.0x normal session pace
+VELOCITY_MULT_THRESHOLD = 2.0
 LOOKBACK_DAYS_HIST = 160
 
 high_beta_50_stocks = [
@@ -64,29 +64,25 @@ high_beta_50_stocks = [
 SESSION_CACHE = {"key": "", "date": ""}
 
 # ==============================================================================
-# 2. JSON MEMORY PERSISTENCE (DAILY DEDUPLICATION)
+# 2. JSON MEMORY PERSISTENCE
 # ==============================================================================
 def load_memory():
-    default_mem = {
-        "date": "",
-        "sma_alerted": [],
-        "vel_alerted": []
-    }
+    default_mem = {"date": "", "sma_alerted": [], "vel_alerted": []}
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r") as f:
                 data = json.load(f)
                 default_mem.update(data)
-        except Exception as e:
-            print(f"⚠️ Memory read warning: {e}")
+        except Exception:
+            pass
     return default_mem
 
 def save_memory(mem):
     try:
         with open(MEMORY_FILE, "w") as f:
             json.dump(mem, f, indent=2)
-    except Exception as e:
-        print(f"⚠️ Memory write warning: {e}")
+    except Exception:
+        pass
 
 # ==============================================================================
 # 3. DEFINEDGE AUTHENTICATION & DATA ENGINE
@@ -116,7 +112,7 @@ def get_definedge_session_key(force_refresh=False):
                 return session_key
         except Exception as e:
             print(f"⚠️ Definedge login attempt {attempt}/3 failed: {e}")
-            time.sleep(4)
+            time.sleep(3)
     raise RuntimeError("Could not authenticate with Definedge API.")
 
 def fetch_definedge_day_df(segment, token, start_dt, end_dt):
@@ -127,17 +123,13 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = requests.get(url, headers={"Authorization": session_key}, timeout=20)
+            resp = requests.get(url, headers={"Authorization": session_key}, timeout=15)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
                 return pd.DataFrame()
 
-            df = pd.read_csv(
-                io.StringIO(resp.text.strip()),
-                header=None,
-                names=["datetime", "open", "high", "low", "close", "volume", "oi"]
-            )
+            df = pd.read_csv(io.StringIO(resp.text.strip()), header=None, names=["datetime", "open", "high", "low", "close", "volume", "oi"])
             if df.empty:
                 return pd.DataFrame()
 
@@ -160,17 +152,13 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = requests.get(url, headers={"Authorization": session_key}, timeout=20)
+            resp = requests.get(url, headers={"Authorization": session_key}, timeout=15)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
                 return pd.DataFrame()
 
-            df = pd.read_csv(
-                io.StringIO(resp.text.strip()),
-                header=None,
-                names=["datetime", "open", "high", "low", "close", "volume", "oi"]
-            )
+            df = pd.read_csv(io.StringIO(resp.text.strip()), header=None, names=["datetime", "open", "high", "low", "close", "volume", "oi"])
             if df.empty:
                 return pd.DataFrame()
 
@@ -197,11 +185,7 @@ def load_definedge_master_tokens():
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
-    nse_eq = df[
-        (df[0] == "NSE")
-        & (df[2].str.strip().isin(stock_set))
-        & (df[4].str.strip() == "EQ")
-    ].copy()
+    nse_eq = df[(df[0] == "NSE") & (df[2].str.strip().isin(stock_set)) & (df[4].str.strip() == "EQ")].copy()
     eq_token_map = {row[2].strip(): row[1].strip() for _, row in nse_eq.iterrows()}
 
     nfo = df[(df[0] == "NFO") & (df[2].str.strip().isin(stock_set))].copy()
@@ -211,28 +195,17 @@ def load_definedge_master_tokens():
     return eq_token_map, fut_map
 
 # ==============================================================================
-# 4. DUAL-CATEGORY EMAIL DISPATCHER
+# 4. EMAIL DISPATCHER
 # ==============================================================================
 def send_dual_category_alert(sma_alerts, vel_alerts):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
     subject = f"⚡ Volume & Velocity Breakouts | SMA: {len(sma_alerts)} | Velocity: {len(vel_alerts)} - [{now_str}]"
 
-    # Plain Text Summary
     print(f"\n📊 {subject}")
-    if sma_alerts:
-        print("--- CATEGORY 1: TRIPLE VOLUME SMA BREAKOUTS ---")
-        for a in sma_alerts:
-            print(f"{a['symbol']} | Vol: {a['current_vol']:,} > Max SMA ({a['max_hurdle']:,})")
-    if vel_alerts:
-        print("--- CATEGORY 2: VELOCITY MULTIPLIER BREAKOUTS ---")
-        for v in vel_alerts:
-            print(f"{v['symbol']} | Velocity Multiplier: {v['velocity_mult']}x")
-
     if not SENDER_EMAIL or not RECEIVER_EMAIL or not APP_PASSWORD:
         print("⚠️ Email credentials missing. Skipping dispatch.")
         return
 
-    # Build HTML Email Body
     sma_table_html = ""
     if sma_alerts:
         headers_1 = ["Stock", "Current Vol", "10d SMA", "50d SMA", "100d SMA", "Time"]
@@ -283,7 +256,7 @@ def send_dual_category_alert(sma_alerts, vel_alerts):
             time.sleep(3)
 
 # ==============================================================================
-# 5. CORE CONTINUOUS SCANNER ENGINE
+# 5. SINGLE-RUN SCANNER EXECUTION
 # ==============================================================================
 def run_scanner_cycle():
     now_ist = datetime.now(IST)
@@ -296,7 +269,7 @@ def run_scanner_cycle():
     sma_already_alerted = set(memory.get("sma_alerted", []))
     vel_already_alerted = set(memory.get("vel_alerted", []))
 
-    print(f"\n🔎 Running Continuous Scan Cycle at {now_ist.strftime('%H:%M:%S IST')}...")
+    print(f"\n🔎 Running Single-Pass Scan Cycle at {now_ist.strftime('%H:%M:%S IST')}...")
     get_definedge_session_key()
     eq_token_map, fut_map = load_definedge_master_tokens()
 
@@ -304,6 +277,7 @@ def run_scanner_cycle():
     start_today = IST.localize(datetime.combine(now_ist.date(), dtime(9, 15)))
     elapsed_seconds = (now_ist - start_today).total_seconds()
     if elapsed_seconds <= 0:
+        print("⏳ Market has not opened yet for today.")
         return
 
     triggered_sma_list = []
@@ -319,7 +293,6 @@ def run_scanner_cycle():
             continue
 
         try:
-            # 1. Fetch Daily History for 10, 50, 100-day Volume SMAs
             df_day = fetch_definedge_day_df(segment_to_use, token_to_use, start_dt_hist, now_ist)
             if df_day.empty or len(df_day) < 100:
                 continue
@@ -331,7 +304,6 @@ def run_scanner_cycle():
             max_sma_hurdle = max(sma_10, sma_50, sma_100)
             avg_daily_vol = float(hist_vol.tail(50).mean())
 
-            # 2. Fetch Today's Intraday 1-Minute Data
             df_1m = fetch_definedge_1m_df(segment_to_use, token_to_use, start_today, now_ist)
             if df_1m.empty:
                 continue
@@ -342,7 +314,7 @@ def run_scanner_cycle():
 
             current_cum_vol = int(today_df["volume"].sum())
 
-            # --- CATEGORY 1: TRIPLE VOLUME SMA CHECK ---
+            # Category 1 Check
             if symbol not in sma_already_alerted and current_cum_vol > max_sma_hurdle:
                 triggered_sma_list.append({
                     "symbol": symbol,
@@ -355,8 +327,7 @@ def run_scanner_cycle():
                 })
                 sma_already_alerted.add(symbol)
 
-            # --- CATEGORY 2: VELOCITY MULTIPLIER CHECK ---
-            # Total session seconds = 22,500 (6.25 hours). Expected volume at this exact second:
+            # Category 2 Check
             expected_vol_now = (avg_daily_vol / 22500.0) * elapsed_seconds
             if expected_vol_now > 0:
                 velocity_mult = round(current_cum_vol / expected_vol_now, 2)
@@ -373,53 +344,14 @@ def run_scanner_cycle():
         except Exception as e:
             print(f"⚠️ Error scanning {symbol}: {e}")
 
-    # Save state memory
     memory["sma_alerted"] = list(sma_already_alerted)
     memory["vel_alerted"] = list(vel_already_alerted)
     save_memory(memory)
 
-    # Dispatch combined email if either category triggered
     if triggered_sma_list or triggered_vel_list:
         send_dual_category_alert(triggered_sma_list, triggered_vel_list)
     else:
         print(f"ℹ️ No new breakouts in this cycle ({now_ist.strftime('%H:%M:%S IST')}).")
 
-# ==============================================================================
-# 6. ALL-DAY CONTINUOUS MARKET CLOCK
-# ==============================================================================
-def start_market_clock():
-    now_ist = datetime.now(IST)
-    print(f"🕒 Starting Continuous Volume & Velocity Scanner Clock at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}...")
-
-    is_weekday = now_ist.weekday() < 5
-    in_market_window = is_weekday and (dtime(9, 10) <= now_ist.time() <= dtime(15, 35))
-
-    if not in_market_window:
-        print("⚡ Running immediate single-pass test scan (outside live market hours)...")
-        run_scanner_cycle()
-        return
-
-    session_cutoff = dtime(15, 32)
-    poll_interval_seconds = 60  # Check every 60 seconds
-
-    try:
-        get_definedge_session_key()
-    except Exception as e:
-        print(f"⚠️ Pre-warm login error: {e}")
-
-    while True:
-        now_ist = datetime.now(IST)
-        if now_ist.time() > session_cutoff:
-            print(f"⏹️ Reached session cutoff ({session_cutoff}). Exiting cleanly for today.")
-            break
-
-        if dtime(9, 15) <= now_ist.time() <= dtime(15, 30):
-            try:
-                run_scanner_cycle()
-            except Exception as e:
-                print(f"⚠️ Error in scanner cycle: {e}")
-
-        time.sleep(poll_interval_seconds)
-
 if __name__ == "__main__":
-    start_market_clock()
+    run_scanner_cycle()
