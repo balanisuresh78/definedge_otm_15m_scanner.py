@@ -46,10 +46,10 @@ APP_PASSWORD = (
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "volume_alert_memory.json"
 
-VELOCITY_MULT_THRESHOLD = 2.0      # Category 2 trigger: Current TPS >= 2.0x Baseline TPS
-MIN_ELAPSED_SECONDS_FOR_VEL = 300  # Wait 5 mins after 09:15 open to avoid 9:15:05 opening auction noise
+VELOCITY_MULT_THRESHOLD = 2.0      # Category 2 trigger: Running TPS >= 2.0x Historical TPS
+MIN_ELAPSED_SECONDS_FOR_VEL = 300  # Wait 5 mins after 09:15 open (09:20 IST) to skip opening auction noise
 POLL_INTERVAL_SECONDS = 60         # Continuous scan frequency during live market hours
-LOOKBACK_DAYS_HIST = 170           # Calendar days to fetch >= 100 trading days
+LOOKBACK_DAYS_HIST = 175           # Calendar days to guarantee >= 100 trading days
 
 high_beta_50_stocks = [
     "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
@@ -63,13 +63,13 @@ high_beta_50_stocks = [
 ]
 
 SESSION_CACHE = {"key": "", "date": ""}
-DAILY_BASELINE_CACHE = {}  # Caches 10d, 50d, 100d SMAs in RAM so loops take ~6 seconds
+DAILY_BASELINE_CACHE = {}
 
 def log(msg):
     print(msg, flush=True)
 
 # ==============================================================================
-# 2. JSON MEMORY PERSISTENCE (ONE ALERT PER STOCK PER DAY)
+# 2. JSON MEMORY PERSISTENCE (ONE ALERT PER STOCK PER CATEGORY PER DAY)
 # ==============================================================================
 def load_memory(session_date_str):
     default_mem = {
@@ -219,23 +219,27 @@ def load_definedge_master_tokens():
     return eq_token_map, fut_map
 
 # ==============================================================================
-# 4. PRE-WARM 10d, 50d, 100d VOLUME AVERAGES (RUNS ONCE AT STARTUP)
+# 4. PRE-WARM 10d, 50d, 100d VOLUME AVERAGES + TRUE YESTERDAY CLOSE
 # ==============================================================================
 def build_daily_volume_baseline_cache(eq_token_map, fut_map, now_ist):
-    log("🌅 Pre-calculating 10, 50 & 100-Day Volume SMAs for 50 High-Beta Stocks...")
+    log("🌅 Pre-calculating 10, 50 & 100-Day Volume SMAs + Exact Previous Day Close...")
     start_dt_hist = (now_ist - timedelta(days=LOOKBACK_DAYS_HIST)).replace(hour=9, minute=15, second=0, microsecond=0)
+    recent_1m_start = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
     today_date = now_ist.date()
 
-    # Determine active session date (falls back to last trading day if tested on weekend/pre-market)
     sample_token = eq_token_map.get("SBIN") or next(iter(eq_token_map.values()))
-    sample_1m = fetch_definedge_1m_df("NSE", sample_token, now_ist - timedelta(days=5), now_ist)
+    sample_1m = fetch_definedge_1m_df("NSE", sample_token, recent_1m_start, now_ist)
     if not sample_1m.empty:
-        active_session_date = sample_1m.index[-1].date()
+        sample_1m_mkt = sample_1m.between_time("09:15", "15:29")
+        unique_dates = sorted(list(set(sample_1m_mkt.index.date)))
+        active_session_date = unique_dates[-1]
+        prev_trading_date = unique_dates[-2] if len(unique_dates) >= 2 else None
     else:
         active_session_date = today_date
+        prev_trading_date = None
 
     if active_session_date != today_date:
-        log(f"ℹ️ Market closed today ({today_date}). Running test scan on latest trading session: {active_session_date}")
+        log(f"ℹ️ Market closed today ({today_date}). Running test scan on latest trading session: {active_session_date} (vs Prev Close on {prev_trading_date})")
 
     for symbol in high_beta_50_stocks:
         eq_token = eq_token_map.get(symbol, "")
@@ -250,25 +254,49 @@ def build_daily_volume_baseline_cache(eq_token_map, fut_map, now_ist):
         if df_day.empty:
             continue
 
-        # Strictly exclude the active session date so averages only use completed prior trading days
-        df_prior = df_day[df_day["date"] < active_session_date].copy()
-        if len(df_prior) < 20:
+        df_recent_1m = fetch_definedge_1m_df(segment_to_use, token_to_use, recent_1m_start, now_ist)
+        df_recent_mkt = df_recent_1m.between_time("09:15", "15:29") if not df_recent_1m.empty else pd.DataFrame()
+
+        df_prior_day = df_day[df_day["date"] < active_session_date].copy()
+        if not df_recent_mkt.empty:
+            recent_daily_from_1m = df_recent_mkt[df_recent_mkt.index.date < active_session_date].groupby(
+                df_recent_mkt[df_recent_mkt.index.date < active_session_date].index.date
+            ).agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum")
+            ).reset_index()
+            recent_daily_from_1m.columns = ["date", "open", "high", "low", "close", "volume"]
+
+            combined_prior = pd.concat(
+                [df_prior_day[["date", "open", "high", "low", "close", "volume"]], recent_daily_from_1m],
+                ignore_index=True
+            )
+            combined_prior = combined_prior.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        else:
+            combined_prior = df_prior_day
+
+        if len(combined_prior) < 20:
             continue
 
-        hist_vol = df_prior["volume"]
-        prev_close = float(df_prior["close"].iloc[-1])
+        prev_close = float(combined_prior["close"].iloc[-1])
+        prev_close_date = combined_prior["date"].iloc[-1]
+
+        hist_vol = combined_prior["volume"]
         sma_10 = float(hist_vol.tail(10).mean())
         sma_50 = float(hist_vol.tail(50).mean())
         sma_100 = float(hist_vol.tail(100).mean())
         max_hurdle = max(sma_10, sma_50, sma_100)
 
-        # Baseline speed in Shares/Second across a 22,500-second (6.25 hr) NSE day
         baseline_tps = max_hurdle / 22500.0
 
         DAILY_BASELINE_CACHE[symbol] = {
             "segment": segment_to_use,
             "token": token_to_use,
             "prev_close": prev_close,
+            "prev_close_date": str(prev_close_date),
             "sma_10": int(round(sma_10)),
             "sma_50": int(round(sma_50)),
             "sma_100": int(round(sma_100)),
@@ -276,130 +304,158 @@ def build_daily_volume_baseline_cache(eq_token_map, fut_map, now_ist):
             "baseline_tps": round(baseline_tps, 2)
         }
 
-    log(f"✅ Cached 10/50/100-Day Volume SMAs for {len(DAILY_BASELINE_CACHE)}/50 stocks.")
+    log(f"✅ Cached 10/50/100-Day Volume SMAs & True Daily Prev Close for {len(DAILY_BASELINE_CACHE)}/50 stocks.")
     return active_session_date
 
 # ==============================================================================
-# 5. CONSISTENCY VS. BULK-ORDER ANALYZER + VWAP BIAS
+# 5. FLOW QUALITY & PURE VWAP BIAS ANALYZER (AT TRIGGER SLICE)
 # ==============================================================================
-def analyze_intraday_flow(today_df, max_hurdle):
+def evaluate_slice_metrics(df_slice, prev_close, max_hurdle):
     """
-    Separates sustained high volume from a single freak bulk order.
-    Also calculates Intraday VWAP to guide CE vs PE option direction.
+    Evaluates Daily % Change, Intraday Typical-Price VWAP, Pure VWAP Bias
+    (Above VWAP -> CE Bias, Below VWAP -> PE Bias), and Flow Quality.
     """
-    cum_vol = int(today_df["volume"].sum())
-    ltp = float(today_df["close"].iloc[-1])
-    vwap = float((today_df["close"] * today_df["volume"]).sum() / cum_vol) if cum_vol > 0 else ltp
-    vwap_bias = "ABOVE VWAP (CE Bias)" if ltp >= vwap else "BELOW VWAP (PE Bias)"
+    cum_vol = int(df_slice["volume"].sum())
+    price = float(df_slice["close"].iloc[-1])
+    pct_chg = round(((price - prev_close) / prev_close) * 100.0, 2) if prev_close > 0 else 0.0
 
-    # Group into 5-minute buckets to detect if a single block trade dominated the day
-    bars_5m = today_df["volume"].resample("5min").sum()
+    # Intraday Typical-Price VWAP = Sum(((H + L + C)/3) * Vol) / Sum(Vol)
+    typical_price = (df_slice["high"] + df_slice["low"] + df_slice["close"]) / 3.0
+    vwap = float((typical_price * df_slice["volume"]).sum() / cum_vol) if cum_vol > 0 else price
+
+    # Pure Intraday VWAP Bias (Independent of Green/Red Day)
+    if price >= vwap:
+        vwap_bias = f"ABOVE VWAP: CE Bias ({vwap:.1f})"
+    else:
+        vwap_bias = f"BELOW VWAP: PE Bias ({vwap:.1f})"
+
+    # Flow Quality: 5-minute bar participation vs single bulk order spike
+    bars_5m = df_slice["volume"].resample("5min").sum()
     num_5m_bars = len(bars_5m)
     max_5m_share = float(bars_5m.max() / cum_vol) if cum_vol > 0 else 1.0
 
-    # Expected volume per 5-minute bar based on the highest daily SMA (75 five-minute bars in 375 mins)
     expected_5m_vol = max_hurdle / 75.0
     active_5m_bars = int((bars_5m >= (0.6 * expected_5m_vol)).sum())
     participation_pct = int(round((active_5m_bars / num_5m_bars) * 100)) if num_5m_bars > 0 else 0
 
-    # If more than 3 bars have elapsed and 1 single 5-min bar has > 50% of all volume, flag as Bulk Spike
     if num_5m_bars >= 4 and max_5m_share > 0.50 and participation_pct < 45:
         flow_tag = f"BULK SPIKE ({participation_pct}% Active)"
     else:
         flow_tag = f"SUSTAINED ({participation_pct}% Active)"
 
-    return ltp, round(vwap, 2), vwap_bias, flow_tag, participation_pct
+    return price, pct_chg, round(vwap, 2), vwap_bias, flow_tag
 
 # ==============================================================================
-# 6. DUAL-CATEGORY HTML + PLAIN TEXT EMAIL SENDER
+# 6. DUAL-CATEGORY HTML + PLAIN TEXT EMAIL SENDER (SORTED BY BOTH + TIME)
 # ==============================================================================
 def send_dual_category_email(sma_alerts, vel_alerts, session_date):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
+    both_count = sum(1 for a in sma_alerts if a.get("in_both")) or sum(1 for v in vel_alerts if v.get("in_both"))
     subject = (
-        f"⚡ High-Beta Volume Alert | Triple SMA: {len(sma_alerts)} | "
-        f"Velocity >= {VELOCITY_MULT_THRESHOLD}x: {len(vel_alerts)} [{now_str}]"
+        f"⚡ High-Beta Volume Alert | ★ Both: {both_count} | "
+        f"Cat 1 (3-SMA): {len(sma_alerts)} | Cat 2 (Vel): {len(vel_alerts)} [{now_str}]"
     )
 
+    # Sort Rule: 1st -> Stocks in BOTH Categories (in_both=True), 2nd -> Chronological Trigger Time (HH:MM)
+    sorted_sma = sorted(sma_alerts, key=lambda x: (0 if x["in_both"] else 1, x["sort_time"]))
+    sorted_vel = sorted(vel_alerts, key=lambda x: (0 if x["in_both"] else 1, x["sort_time"]))
+
     headers_cat1 = [
-        "Stock (% Chg)", "Cum Vol", "10d SMA", "50d SMA", "100d SMA",
-        "Flow Quality", "VWAP Bias", "Cross Time"
+        "Stock (Daily %)", "Category Match", "Trigger Time", "LTP",
+        "Vol at Trigger (Current)", "10d SMA", "50d SMA", "100d SMA", "Flow Quality", "VWAP Bias"
     ]
     rows_cat1 = [
         [
-            f"{a['symbol']} ({a['pct_chg']:+.1f}%)",
-            f"{a['current_vol']:,}",
+            f"{a['symbol']} ({a['pct_chg']:+.2f}%)",
+            f"★ BOTH (Vel @ {a['vel_cross_hm']})" if a["in_both"] else "Cat 1 Only",
+            a["trigger_time"],
+            f"{a['price']:.2f}",
+            f"{a['trigger_vol']:,} ({a['current_vol']:,})",
             f"{a['sma_10']:,}",
             f"{a['sma_50']:,}",
             f"{a['sma_100']:,}",
             a["flow_tag"],
-            a["vwap_bias"],
-            a["cross_time"]
+            a["vwap_bias"]
         ]
-        for a in sorted(sma_alerts, key=lambda x: x["vol_vs_max_ratio"], reverse=True)
+        for a in sorted_sma
     ]
 
     headers_cat2 = [
-        "Stock (% Chg)", "Velocity Mult", "Live TPS (Sh/s)", "Hist TPS (Sh/s)",
-        "Cum Vol", "Flow Quality", "VWAP Bias"
+        "Stock (Daily %)", "Category Match", "Trigger Time", "LTP",
+        "Velocity Mult", "Trigger TPS (Hist TPS)", "Cum Vol", "Flow Quality", "VWAP Bias"
     ]
     rows_cat2 = [
         [
-            f"{v['symbol']} ({v['pct_chg']:+.1f}%)",
+            f"{v['symbol']} ({v['pct_chg']:+.2f}%)",
+            f"★ BOTH (3-SMA @ {v['sma_cross_hm']})" if v["in_both"] else "Cat 2 Only",
+            v["trigger_time"],
+            f"{v['price']:.2f}",
             f"{v['velocity_mult']:.2f}x",
-            f"{v['live_tps']:,}/s",
-            f"{v['baseline_tps']:,}/s",
+            f"{v['live_tps']:,}/s ({v['baseline_tps']:,}/s)",
             f"{v['current_vol']:,}",
             v["flow_tag"],
             v["vwap_bias"]
         ]
-        for v in sorted(vel_alerts, key=lambda x: x["velocity_mult"], reverse=True)
+        for v in sorted_vel
     ]
 
-    plain_parts = [f"Session Date: {session_date} | Generated: {now_str}\n"]
+    plain_parts = [
+        f"Session Date: {session_date} | Alert Generated: {now_str} IST",
+        "Sorting: [1] Stocks in BOTH Categories at Top -> [2] Chronological Trigger Time (Earliest First)\n"
+    ]
     if rows_cat1:
-        plain_parts.append("=== CATEGORY 1: TRIPLE VOLUME SMA BREAKOUTS (Vol > 10d, 50d & 100d) ===")
+        plain_parts.append("=== CATEGORY 1: VOLUME GREATER THAN ALL 3 AVERAGES (10d, 50d & 100d SMA) ===")
         plain_parts.append(tabulate(rows_cat1, headers=headers_cat1, tablefmt="simple") + "\n")
     if rows_cat2:
-        plain_parts.append(f"=== CATEGORY 2: VELOCITY MULTIPLIER BREAKOUTS (>= {VELOCITY_MULT_THRESHOLD}x Pace) ===")
+        plain_parts.append(f"=== CATEGORY 2: VELOCITY MULTIPLIER BREAKOUTS (>= {VELOCITY_MULT_THRESHOLD}x Historical Pace) ===")
         plain_parts.append(tabulate(rows_cat2, headers=headers_cat2, tablefmt="simple") + "\n")
 
     plain_body = "\n".join(plain_parts)
-    log(f"\n📧 DISPATCHING ALERT:\n{plain_body}")
+    log(f"\n📧 DISPATCHING DUAL-CATEGORY ALERT:\n{plain_body}")
 
     if not SENDER_EMAIL or not RECEIVER_EMAIL or not APP_PASSWORD:
         log("⚠️ Email credentials missing in environment. Skipping SMTP send.")
         return
 
-    def build_html_table(headers, rows, header_bg):
+    def build_html_table(headers, rows, sorted_items, header_bg):
         if not rows:
             return "<p style='color:#64748b;'>No new triggers in this category on this cycle.</p>"
         th = "".join(
-            f'<th style="background-color:{header_bg};color:#ffffff;padding:9px 12px;border:1px solid #cbd5e1;text-align:left;font-size:14px;">{h}</th>'
+            f'<th style="background-color:{header_bg};color:#ffffff;padding:9px 12px;border:1px solid #cbd5e1;text-align:left;font-size:14px;white-space:nowrap;">{h}</th>'
             for h in headers
         )
         trs = []
-        for i, r in enumerate(rows):
-            bg = "#f8fafc" if i % 2 == 1 else "#ffffff"
+        for i, (r, item) in enumerate(zip(rows, sorted_items)):
+            # Highlight stocks present in BOTH categories with a soft gold row background
+            if item.get("in_both"):
+                bg = "#fef9c3"
+                font_wt = "600"
+            else:
+                bg = "#f8fafc" if i % 2 == 1 else "#ffffff"
+                font_wt = "400"
             tds = "".join(
-                f'<td style="padding:8px 12px;border:1px solid #cbd5e1;font-size:14px;color:#0f172a;white-space:nowrap;">{cell}</td>'
+                f'<td style="padding:8px 12px;border:1px solid #cbd5e1;font-size:14px;color:#0f172a;font-weight:{font_wt};white-space:nowrap;">{cell}</td>'
                 for cell in r
             )
             trs.append(f'<tr style="background-color:{bg};">{tds}</tr>')
         return f'<table style="border-collapse:collapse;font-family:Consolas,monospace;margin-bottom:18px;"><thead><tr>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>'
 
-    html_cat1 = build_html_table(headers_cat1, rows_cat1, "#1e293b")
-    html_cat2 = build_html_table(headers_cat2, rows_cat2, "#065f46")
+    html_cat1 = build_html_table(headers_cat1, rows_cat1, sorted_sma, "#1e293b")
+    html_cat2 = build_html_table(headers_cat2, rows_cat2, sorted_vel, "#065f46")
 
     html_body = f"""
     <html>
     <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;font-size:15px;color:#0f172a;">
         <h3 style="margin:0 0 6px 0;">⚡ High-Beta Underlying Volume & Velocity Breakout Alert</h3>
-        <p style="margin:0 0 16px 0;color:#475569;">
-            <strong>Session Date:</strong> {session_date} &nbsp;|&nbsp; <strong>Alert Time:</strong> {now_str} IST
+        <p style="margin:0 0 6px 0;color:#475569;">
+            <strong>Trading Session:</strong> {session_date} &nbsp;|&nbsp; <strong>Dispatched:</strong> {now_str} IST
+        </p>
+        <p style="margin:0 0 16px 0;color:#334155;font-size:14px;">
+            <strong>Sorting Order:</strong> Stocks appearing in <strong>★ BOTH Categories</strong> are pinned to the top (highlighted in gold), followed by <strong>Trigger Time</strong> chronologically.
         </p>
 
         <h4 style="margin:0 0 8px 0;color:#1e293b;">
-            📌 Category 1: Volume Greater Than All 3 Averages (10d, 50d & 100d SMA) — [{len(rows_cat1)} Stocks]
+            📌 Category 1: Volume Surpassed All 3 Averages (10d, 50d & 100d SMA) — [{len(rows_cat1)} Stocks]
         </h4>
         {html_cat1}
 
@@ -430,7 +486,7 @@ def send_dual_category_email(sma_alerts, vel_alerts, session_date):
             time.sleep(2)
 
 # ==============================================================================
-# 7. FAST INTRADAY SCANNER CYCLE (~6 SECONDS PER PASS)
+# 7. FAST INTRADAY SCANNER CYCLE
 # ==============================================================================
 def run_intraday_scan_pass(active_session_date):
     now_ist = datetime.now(IST)
@@ -460,88 +516,160 @@ def run_intraday_scan_pass(active_session_date):
             today_df["cum_vol"] = today_df["volume"].cumsum()
             current_cum_vol = int(today_df["cum_vol"].iloc[-1])
             max_hurdle = base["max_hurdle"]
+            prev_close = base["prev_close"]
 
-            # Elapsed seconds from 09:15:00 to latest available 1-min bar close
-            latest_bar_end = today_df.index[-1] + timedelta(minutes=1)
-            elapsed_seconds = max(60.0, min(22500.0, (latest_bar_end - start_session_dt).total_seconds()))
+            # Vectorized elapsed seconds and running velocity for every 1-minute bar today
+            bar_end_times = today_df.index + timedelta(minutes=1)
+            elapsed_secs_series = np.clip((bar_end_times - start_session_dt).total_seconds(), 60.0, 22500.0)
+            today_df["elapsed_sec"] = elapsed_secs_series
+            today_df["running_tps"] = today_df["cum_vol"] / today_df["elapsed_sec"]
+            today_df["running_vel_mult"] = (
+                today_df["running_tps"] / base["baseline_tps"] if base["baseline_tps"] > 0 else 0.0
+            )
 
-            live_tps = round(current_cum_vol / elapsed_seconds, 2)
-            velocity_mult = round(live_tps / base["baseline_tps"], 2) if base["baseline_tps"] > 0 else 0.0
+            # Latest snapshot for the live console summary
+            cur_price, cur_pct_chg, cur_vwap, cur_vwap_bias, cur_flow_tag = evaluate_slice_metrics(
+                today_df, prev_close, max_hurdle
+            )
+            cur_vel_mult = round(float(today_df["running_vel_mult"].iloc[-1]), 2)
             vol_vs_max_ratio = round(current_cum_vol / max_hurdle, 2) if max_hurdle > 0 else 0.0
 
-            ltp, vwap, vwap_bias, flow_tag, part_pct = analyze_intraday_flow(today_df, max_hurdle)
-            pct_chg = round(((ltp - base["prev_close"]) / base["prev_close"]) * 100.0, 2) if base["prev_close"] > 0 else 0.0
+            # Find exact arrival times if crossed today
+            sma_cross_df = today_df[today_df["cum_vol"] > max_hurdle]
+            sma_cross_hm = sma_cross_df.index[0].strftime("%H:%M") if not sma_cross_df.empty else "-"
+
+            vel_cross_df = today_df[
+                (today_df["elapsed_sec"] >= MIN_ELAPSED_SECONDS_FOR_VEL)
+                & (today_df["running_vel_mult"] >= VELOCITY_MULT_THRESHOLD)
+            ]
+            vel_cross_hm = vel_cross_df.index[0].strftime("%H:%M") if not vel_cross_df.empty else "-"
+
+            in_both_today = (not sma_cross_df.empty) and (not vel_cross_df.empty)
+            in_any_today = (not sma_cross_df.empty) or (not vel_cross_df.empty)
+            earliest_trig_hm = min(
+                [t for t in (sma_cross_hm, vel_cross_hm) if t != "-"],
+                default="99:99"
+            )
 
             live_dashboard_rows.append({
                 "symbol": symbol,
-                "pct_chg": pct_chg,
+                "pct_chg": cur_pct_chg,
+                "price": cur_price,
                 "cum_vol": current_cum_vol,
                 "max_hurdle": max_hurdle,
                 "vol_pct_of_max": int(round(vol_vs_max_ratio * 100)),
-                "velocity_mult": velocity_mult,
-                "flow_tag": flow_tag,
-                "vwap_bias": vwap_bias
+                "in_both": in_both_today,
+                "in_any": in_any_today,
+                "earliest_trig_hm": earliest_trig_hm,
+                "sma_cross_hm": sma_cross_hm,
+                "vel_cross_hm": vel_cross_hm,
+                "velocity_mult": cur_vel_mult,
+                "flow_tag": cur_flow_tag,
+                "vwap_bias": cur_vwap_bias
             })
 
             # --- CATEGORY 1: VOLUME GREATER THAN ALL 3 AVERAGES (10d, 50d, 100d) ---
-            if symbol not in sma_already_alerted and current_cum_vol > max_hurdle:
-                cross_rows = today_df[today_df["cum_vol"] > max_hurdle]
-                cross_time = cross_rows.index[0].strftime("%H:%M") if not cross_rows.empty else now_ist.strftime("%H:%M")
+            if symbol not in sma_already_alerted and not sma_cross_df.empty:
+                first_cross_ts = sma_cross_df.index[0]
+                slice_at_cross = today_df.loc[:first_cross_ts]
+                trig_price, trig_pct, trig_vwap, trig_bias, trig_flow = evaluate_slice_metrics(
+                    slice_at_cross, prev_close, max_hurdle
+                )
+                trig_vol = int(slice_at_cross["cum_vol"].iloc[-1])
 
                 new_sma_alerts.append({
                     "symbol": symbol,
-                    "pct_chg": pct_chg,
+                    "sort_time": first_cross_ts.strftime("%H:%M"),
+                    "trigger_time": first_cross_ts.strftime("%H:%M IST"),
+                    "sma_cross_hm": sma_cross_hm,
+                    "vel_cross_hm": vel_cross_hm,
+                    "in_both": in_both_today,
+                    "price": trig_price,
+                    "pct_chg": trig_pct,
+                    "trigger_vol": trig_vol,
                     "current_vol": current_cum_vol,
                     "sma_10": base["sma_10"],
                     "sma_50": base["sma_50"],
                     "sma_100": base["sma_100"],
                     "max_hurdle": max_hurdle,
                     "vol_vs_max_ratio": vol_vs_max_ratio,
-                    "flow_tag": flow_tag,
-                    "vwap_bias": vwap_bias,
-                    "cross_time": cross_time
+                    "flow_tag": trig_flow,
+                    "vwap_bias": trig_bias
                 })
                 sma_already_alerted.add(symbol)
 
             # --- CATEGORY 2: VELOCITY MULTIPLIER BREAKOUT ---
-            if (
-                symbol not in vel_already_alerted
-                and elapsed_seconds >= MIN_ELAPSED_SECONDS_FOR_VEL
-                and velocity_mult >= VELOCITY_MULT_THRESHOLD
-            ):
+            if symbol not in vel_already_alerted and not vel_cross_df.empty:
+                first_vel_ts = vel_cross_df.index[0]
+                slice_at_vel = today_df.loc[:first_vel_ts]
+                v_price, v_pct, v_vwap, v_bias, v_flow = evaluate_slice_metrics(
+                    slice_at_vel, prev_close, max_hurdle
+                )
+                v_mult_at_trig = round(float(slice_at_vel["running_vel_mult"].iloc[-1]), 2)
+                v_tps_at_trig = round(float(slice_at_vel["running_tps"].iloc[-1]), 2)
+                v_vol_at_trig = int(slice_at_vel["cum_vol"].iloc[-1])
+
                 new_vel_alerts.append({
                     "symbol": symbol,
-                    "pct_chg": pct_chg,
-                    "velocity_mult": velocity_mult,
-                    "live_tps": live_tps,
+                    "sort_time": first_vel_ts.strftime("%H:%M"),
+                    "trigger_time": first_vel_ts.strftime("%H:%M IST"),
+                    "sma_cross_hm": sma_cross_hm,
+                    "vel_cross_hm": vel_cross_hm,
+                    "in_both": in_both_today,
+                    "price": v_price,
+                    "pct_chg": v_pct,
+                    "velocity_mult": v_mult_at_trig,
+                    "live_tps": v_tps_at_trig,
                     "baseline_tps": base["baseline_tps"],
-                    "current_vol": current_cum_vol,
-                    "flow_tag": flow_tag,
-                    "vwap_bias": vwap_bias
+                    "current_vol": v_vol_at_trig,
+                    "flow_tag": v_flow,
+                    "vwap_bias": v_bias
                 })
                 vel_already_alerted.add(symbol)
 
         except Exception as e:
             log(f"⚠️ Error scanning {symbol}: {e}")
 
-    # Print Top 10 Live Status Table in GitHub Actions Console on every pass
+    # Ensure any stock that triggered the other category earlier today is also marked in_both
+    both_cats_today_set = sma_already_alerted.intersection(vel_already_alerted)
+    for a in new_sma_alerts:
+        if a["symbol"] in both_cats_today_set:
+            a["in_both"] = True
+    for v in new_vel_alerts:
+        if v["symbol"] in both_cats_today_set:
+            v["in_both"] = True
+
+    # Print Live Status Table in GitHub Actions Console (Sorted: ★ BOTH -> Trigger Time -> % of Max SMA)
     if live_dashboard_rows:
-        top_rows = sorted(live_dashboard_rows, key=lambda x: x["velocity_mult"], reverse=True)[:10]
+        top_rows = sorted(
+            live_dashboard_rows,
+            key=lambda x: (
+                0 if x["in_both"] else (1 if x["in_any"] else 2),
+                x["earliest_trig_hm"],
+                -x["vol_pct_of_max"]
+            )
+        )[:15]
         console_table = [
             [
-                f"{r['symbol']} ({r['pct_chg']:+.1f}%)",
-                f"{r['cum_vol']:,}",
-                f"{r['max_hurdle']:,} ({r['vol_pct_of_max']}%)",
+                f"{r['symbol']} ({r['pct_chg']:+.2f}%)",
+                "★ BOTH CATS" if r["in_both"] else ("1 CAT" if r["in_any"] else "-"),
+                f"{r['price']:.2f}",
+                r["sma_cross_hm"],
+                r["vel_cross_hm"],
+                f"{r['cum_vol']:,} ({r['vol_pct_of_max']}%)",
                 f"{r['velocity_mult']:.2f}x",
                 r["flow_tag"],
                 r["vwap_bias"]
             ]
             for r in top_rows
         ]
-        log(f"\n📊 Top 10 High-Beta Stocks by Intraday Velocity ({now_ist.strftime('%H:%M:%S IST')}):")
+        log(f"\n📊 Live High-Beta Dashboard [Sorted: ★ BOTH -> Trigger Time] ({now_ist.strftime('%H:%M:%S IST')}):")
         log(tabulate(
             console_table,
-            headers=["Stock", "Cum Vol", "Max(10,50,100) SMA", "Velocity Mult", "Flow Quality", "VWAP Bias"],
+            headers=[
+                "Stock (Daily %)", "Match", "LTP", "3-SMA Time", "Vel>=2x Time",
+                "Cum Vol (% Max SMA)", "Live Vel", "Flow Quality", "VWAP Bias"
+            ],
             tablefmt="simple"
         ))
 
@@ -554,7 +682,8 @@ def run_intraday_scan_pass(active_session_date):
     else:
         log(
             f"ℹ️ No new first-time triggers on this pass "
-            f"(Already alerted today -> SMA: {len(sma_already_alerted)}, Velocity: {len(vel_already_alerted)})."
+            f"(Already alerted today -> Cat 1 [3-SMA]: {len(sma_already_alerted)}, "
+            f"Cat 2 [Velocity]: {len(vel_already_alerted)}, ★ Both: {len(both_cats_today_set)})."
         )
 
 # ==============================================================================
@@ -571,14 +700,12 @@ def main():
     is_weekday = now_ist.weekday() < 5
     in_live_hours = is_weekday and (dtime(9, 10) <= now_ist.time() <= dtime(15, 32))
 
-    # If triggered manually outside market hours (or on a weekend), run 1 full pass and exit cleanly
     if not in_live_hours:
         log("⚡ Outside live NSE market hours — running immediate single-pass verification scan & exiting...")
         run_intraday_scan_pass(active_session_date)
         log("🏁 Single-pass verification complete.")
         return
 
-    # During live weekday market hours, poll continuously until 15:31 IST
     session_cutoff = dtime(15, 31)
     while True:
         now_ist = datetime.now(IST)
