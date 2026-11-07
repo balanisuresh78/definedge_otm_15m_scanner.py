@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from tabulate import tabulate
 
 # ==============================================================================
-# 1. CREDENTIALS & CONFIGURATION
+# 1. CREDENTIALS & CONFIGURATION (SHARED GITHUB SECRETS)
 # ==============================================================================
 DEFINEDGE_API_TOKEN = os.environ.get("DEFINEDGE_API_TOKEN", "").strip()
 DEFINEDGE_API_SECRET = os.environ.get("DEFINEDGE_API_SECRET", "").strip()
@@ -45,13 +45,13 @@ APP_PASSWORD = (
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "volume_alert_memory.json"
-MEMORY_SCHEMA_VERSION = "v3_strict_dict_timestamps"
+MEMORY_SCHEMA_VERSION = "v4_strict_dict_priority_guarded"
 
 # --- QUANTITATIVE THRESHOLDS ---
 VELOCITY_MULT_THRESHOLD = 2.0        # Category 2: Session TPS >= 2.0x Historical Baseline TPS
-ROLLING_15M_VEL_THRESHOLD = 1.75     # Category 2: Rolling 15m TPS must also be >= 1.75x (kills dead opening spikes)
-MIN_VOL_FRACTION_FOR_VEL = 0.35      # Category 2: Cum Vol must be >= 35% of Max SMA (real institutional size)
-VEL_START_ELAPSED_SECONDS = 900      # Category 2: Starts at 09:30 IST (900s after 09:15) after opening 15m range settles
+ROLLING_15M_VEL_THRESHOLD = 1.75     # Category 2: Rolling 15m TPS >= 1.75x (confirms active flow, not stale 9:15 spike)
+MIN_VOL_FRACTION_FOR_VEL = 0.35      # Category 2: Cum Vol >= 35% of Max SMA (real institutional size)
+VEL_START_ELAPSED_SECONDS = 900      # Category 2: Evaluates from 09:30 IST onward (after first 15m range settles)
 POLL_INTERVAL_SECONDS = 60           # Continuous scan frequency during live market hours
 LOOKBACK_DAYS_HIST = 175             # Calendar days to guarantee >= 100 trading days
 
@@ -109,8 +109,35 @@ def save_memory(mem):
         log(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTHENTICATION & DATA ENGINE
+# 3. 15m OTM SCANNER PRIORITY GUARD & DEFINEDGE DATA ENGINE
 # ==============================================================================
+def wait_for_main_15m_scanner_priority():
+    """
+    Your main definedge_otm_15m_scanner.py runs checkpoints at :00:12, :15:12, :30:12, and :45:12.
+    This guard pauses the continuous volume scanner from :14:40 to :15:55 (and :29:40-:30:55, etc.)
+    so the main 15m OTM scanner gets 100% exclusive API bandwidth and TOTP window priority.
+    """
+    while True:
+        now_ist = datetime.now(IST)
+        # Only enforce checkpoint yielding during live weekday market hours
+        if now_ist.weekday() >= 5 or not (dtime(9, 14) <= now_ist.time() <= dtime(15, 32)):
+            break
+
+        m, s = now_ist.minute, now_ist.second
+
+        # Inside a 15-minute checkpoint minute (:00, :15, :30, :45) before :55s
+        if (m % 15 == 0) and (s < 55):
+            wait_secs = 55 - s
+            log(f"🛡️ Yielding API priority to main 15m OTM scanner ({now_ist.strftime('%H:%M:%S')}) — pausing {wait_secs}s...")
+            time.sleep(wait_secs)
+        # Approaching a 15-minute checkpoint (:14:40, :29:40, :44:40, :59:40)
+        elif (m % 15 == 14) and (s >= 40):
+            wait_secs = (60 - s) + 55
+            log(f"🛡️ Approaching 15m OTM checkpoint ({now_ist.strftime('%H:%M:%S')}) — yielding for {wait_secs}s...")
+            time.sleep(wait_secs)
+        else:
+            break
+
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     if not force_refresh and SESSION_CACHE["key"] and SESSION_CACHE["date"] == today_str:
@@ -118,6 +145,10 @@ def get_definedge_session_key(force_refresh=False):
 
     for attempt in range(1, 4):
         try:
+            # If refreshing due to a 401, ensure we are not inside the main scanner's 15m checkpoint
+            if force_refresh:
+                wait_for_main_15m_scanner_priority()
+
             url_step1 = f"https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/login/{DEFINEDGE_API_TOKEN}"
             r1 = requests.get(url_step1, headers={"api_secret": DEFINEDGE_API_SECRET}, timeout=12)
             r1.raise_for_status()
@@ -136,7 +167,8 @@ def get_definedge_session_key(force_refresh=False):
                 return session_key
         except Exception as e:
             log(f"⚠️ Definedge login attempt {attempt}/3 failed: {e}")
-            time.sleep(3)
+            # Sleep 31s if TOTP code was just consumed by the other scanner
+            time.sleep(31 if attempt == 1 else 5)
     raise RuntimeError("Could not authenticate with Definedge API. Check GitHub Secrets.")
 
 def fetch_definedge_day_df(segment, token, start_dt, end_dt):
@@ -544,7 +576,7 @@ def run_intraday_scan_pass(active_session_date):
             today_df["running_tps"] = today_df["cum_vol"] / today_df["elapsed_sec"]
             today_df["running_vel_mult"] = today_df["running_tps"] / baseline_tps if baseline_tps > 0 else 0.0
 
-            # 2. Rolling 15-minute TPS (900 seconds) to ensure velocity is actively sustained, not an old 9:15 spike
+            # 2. Rolling 15-minute TPS (900 seconds) to confirm sustained velocity
             rolling_15m_vol = today_df["volume"].rolling(window=15, min_periods=5).sum()
             rolling_15m_tps = rolling_15m_vol / 900.0
             today_df["roll15_vel_mult"] = rolling_15m_tps / baseline_tps if baseline_tps > 0 else 0.0
@@ -553,7 +585,7 @@ def run_intraday_scan_pass(active_session_date):
             sma_cross_df = today_df[today_df["cum_vol"] > max_hurdle]
             sma_cross_hm = sma_cross_df.index[0].strftime("%H:%M") if not sma_cross_df.empty else "-"
 
-            # 4. Category 2 Detection: Post-9:30 stabilization + >=35% of Max SMA + Session Vel >= 2.0x + Rolling 15m Vel >= 1.75x
+            # 4. Category 2 Detection: Post-9:30 + >=35% of Max SMA + Session Vel >= 2.0x + Rolling 15m Vel >= 1.75x
             vel_cond = (
                 (today_df["elapsed_sec"] >= VEL_START_ELAPSED_SECONDS)
                 & (today_df["cum_vol"] >= (MIN_VOL_FRACTION_FOR_VEL * max_hurdle))
@@ -721,12 +753,18 @@ def run_intraday_scan_pass(active_session_date):
         )
 
 # ==============================================================================
-# 8. CONTINUOUS MARKET CLOCK (WITH AUTOMATIC FRESH RESET ON MANUAL TEST RUNS)
+# 8. CONTINUOUS MARKET CLOCK (YIELDS PRIORITY TO 15m OTM SCANNER CHECKPOINTS)
 # ==============================================================================
 def main():
+    job_start_ts = time.time()
+    max_runtime_seconds = 354 * 60  # Clean exit at 354 mins before GitHub's 360m hard limit
+
     now_ist = datetime.now(IST)
     event_name = os.environ.get("GITHUB_EVENT_NAME", "manual")
     log(f"🚀 Starting High-Beta Triple-SMA & Velocity Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} (Trigger: {event_name})")
+
+    # Yield if starting right on a 15-minute boundary so login doesn't collide with main 15m OTM scanner
+    wait_for_main_15m_scanner_priority()
 
     get_definedge_session_key()
     eq_token_map, fut_map = load_definedge_master_tokens()
@@ -735,7 +773,7 @@ def main():
     is_weekday = now_ist.weekday() < 5
     in_live_hours = is_weekday and (dtime(9, 10) <= now_ist.time() <= dtime(15, 32))
 
-    # Outside live market hours (weekend/evening test), ALWAYS reset memory so verification email is sent
+    # Outside live market hours (weekend/evening test), reset memory & run 1 verification pass
     if not in_live_hours:
         log("⚡ Outside live NSE market hours — resetting test memory & running full verification scan...")
         reset_memory(str(active_session_date))
@@ -743,7 +781,7 @@ def main():
         log("🏁 Verification scan & email dispatch complete.")
         return
 
-    # During live market hours, poll continuously every 60s until 15:31 IST
+    # During live weekday market hours, poll continuously while yielding at every 15m checkpoint
     session_cutoff = dtime(15, 31)
     while True:
         now_ist = datetime.now(IST)
@@ -751,7 +789,14 @@ def main():
             log(f"⏹️ Market session ended ({session_cutoff}). Exiting cleanly.")
             break
 
+        if (time.time() - job_start_ts) >= max_runtime_seconds:
+            log("⏹️ Approaching 360-minute GitHub runner limit. Exiting cleanly with green status.")
+            break
+
         if now_ist.time() >= dtime(9, 15):
+            # Yield API bandwidth whenever main 15m OTM scanner is running its checkpoint
+            wait_for_main_15m_scanner_priority()
+
             cycle_start = time.time()
             run_intraday_scan_pass(active_session_date)
             elapsed = time.time() - cycle_start
