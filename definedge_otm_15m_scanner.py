@@ -10,6 +10,7 @@ import requests
 import pytz
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, time as dtime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -46,14 +47,23 @@ APP_PASSWORD = (
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
-BASKET_VERSION = "v4_official_daily_close"
+BASKET_VERSION = "v6_100stocks_100d_body_diff_top3_oi"
 
+# Daily Filter (Yesterday Body < 0.67 * 100d Avg Body) & Top-3 OTM OI Settings
+YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
+DAILY_ATR_PERIOD = 100
+DAILY_BODY_ATR_MAX_MULT = 0.67
+DAILY_100D_BASELINE_MODE = "BODY_DIFF"
+TOP_N_OTM_POOL = 3
+SELECT_HIGHEST_OI_ON_MATCH = True
+
+# 15m Breakout Parameters
 ATR_PERIOD = 2
 ATR_MULT_THRESHOLD = 1.5
 VOL_MULT_THRESHOLD = 1.5
 ATR_METHOD = "SMA"  # "SMA" or "RMA"
-YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
 
+LOOKBACK_DAYS_DAILY = 185
 LOOKBACK_DAYS_15M = 7
 LOOKBACK_DAYS_100D_SLOT = 160
 
@@ -67,15 +77,23 @@ SCAN_CHECKPOINTS_IST = [
     dtime(15, 30, 12)
 ]
 
-high_beta_50_stocks = [
+high_beta_100_stocks = [
     "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
-    "FEDERALBNK", "ICICIBANK", "INDUSINDBK", "PNB", "SBIN", "SHRIRAMFIN",
-    "ANGELONE", "BSE", "CDSL", "MCX",
+    "FEDERALBNK", "HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDUSINDBK", "KOTAKBANK",
+    "PNB", "RBLBANK", "SBIN", "SHRIRAMFIN", "AUBANK", "BANDHANBNK",
+    "ABCAPITAL", "LICHSGFIN", "LTF", "MANAPPURAM",
+    "ANGELONE", "BSE", "CDSL", "MCX", "CAMS", "HDFCAMC", "JIOFIN", "MUTHOOTFIN",
     "BDL", "BEL", "BHEL", "HAL", "IRFC", "MAZDOCK", "PFC", "RECLTD",
+    "TATAPOWER", "JSWENERGY", "NTPC", "POWERGRID", "COALINDIA", "ONGC",
+    "BPCL", "HINDPETRO", "IOC", "GAIL", "IREDA", "RVNL",
     "ABB", "CGPOWER", "CUMMINSIND", "DIXON", "KAYNES", "POLYCAB", "SIEMENS",
-    "ADANIENT", "ADANIPORTS", "HINDALCO", "HINDCOPPER", "JINDALSTEL", "TATASTEEL", "VEDL",
-    "BAJAJ-AUTO", "M&M", "MOTHERSON", "TATAMOTORS", "TRENT", "ZOMATO",
-    "COFORGE", "DLF", "GODREJPROP", "OBEROIRLTY", "OFSS", "PERSISTENT"
+    "HAVELLS", "VOLTAS", "BHARATFORG", "ASTRAL",
+    "ADANIENT", "ADANIPORTS", "ADANIGREEN", "ADANIENSOL", "HINDALCO", "HINDCOPPER",
+    "JINDALSTEL", "JSWSTEEL", "TATASTEEL", "VEDL", "NMDC", "NATIONALUM",
+    "BAJAJ-AUTO", "M&M", "MARUTI", "MOTHERSON", "TATAMOTORS", "TVSMOTOR",
+    "EICHERMOT", "ASHOKLEY", "TRENT", "ZOMATO", "BHARTIARTL", "INDIGO", "INDUSTOWER",
+    "COFORGE", "PERSISTENT", "OFSS", "INFY", "TCS", "HCLTECH", "TECHM", "KPITTECH",
+    "DLF", "GODREJPROP", "OBEROIRLTY", "LT", "DIVISLAB", "LAURUSLABS"
 ]
 
 SESSION_CACHE = {"key": "", "date": ""}
@@ -108,7 +126,7 @@ def save_memory(mem):
         print(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTHENTICATION & HISTORICAL DATA ENGINE (DAILY + 1M)
+# 3. DEFINEDGE AUTHENTICATION & HISTORICAL DATA ENGINE (DAILY + 1M + OI)
 # ==============================================================================
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -164,9 +182,10 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
             df["date"] = pd.to_datetime(raw_d, format="%d%m%Y", errors="coerce").dt.date
             df = df.dropna(subset=["date"]).sort_values("date")
 
-            for col in ["open", "high", "low", "close", "volume"]:
+            for col in ["open", "high", "low", "close", "volume", "oi"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.dropna(subset=["open", "close"]).drop_duplicates(subset=["date"], keep="last")
+            df["oi"] = df["oi"].fillna(0)
+            df = df.dropna(subset=["open", "high", "low", "close"]).drop_duplicates(subset=["date"], keep="last")
             return df
         except Exception as e:
             if attempt == 2:
@@ -201,8 +220,9 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
             df["datetime"] = df["datetime"].dt.tz_localize(IST)
             df = df.set_index("datetime").sort_index()
 
-            for col in ["open", "high", "low", "close", "volume"]:
+            for col in ["open", "high", "low", "close", "volume", "oi"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["oi"] = df["oi"].fillna(0)
             return df.dropna(subset=["open", "close"])
         except Exception as e:
             if attempt == 2:
@@ -211,7 +231,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     return pd.DataFrame()
 
 # ==============================================================================
-# 4. MASTER SYMBOL PARSING & OFFICIAL DAILY CANDLE BASKET BUILDER
+# 4. MASTER PARSING, 100-DAY AVG BODY FILTER & TOP-3 OTM POOL BUILDER
 # ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
@@ -247,7 +267,7 @@ def extract_strike_and_type_from_row(row, underlying, trading_symbol):
 
 def load_definedge_master_data():
     today = datetime.now(IST).date()
-    stock_set = set(high_beta_50_stocks)
+    stock_set = set(high_beta_100_stocks)
 
     url = "https://app.definedgesecurities.com/public/allmaster.zip"
     resp = requests.get(url, timeout=30)
@@ -308,109 +328,137 @@ def load_definedge_master_data():
     return eq_token_map, fut_map, options_by_stock
 
 def get_yesterday_daily_stats(eq_token, fut_token, today_date, now_ist):
-    start_dt_day = (now_ist - timedelta(days=20)).replace(hour=9, minute=15, second=0, microsecond=0)
+    start_dt_day = (now_ist - timedelta(days=LOOKBACK_DAYS_DAILY)).replace(hour=9, minute=15, second=0, microsecond=0)
 
     df_fut_day = fetch_definedge_day_df("NFO", fut_token, start_dt_day, now_ist)
-    df_fut_prev = df_fut_day[df_fut_day["date"] < today_date] if not df_fut_day.empty else pd.DataFrame()
+    df_fut_prev = df_fut_day[df_fut_day["date"] < today_date].copy() if not df_fut_day.empty else pd.DataFrame()
 
     df_eq_day = fetch_definedge_day_df("NSE", eq_token, start_dt_day, now_ist) if eq_token else pd.DataFrame()
-    df_eq_prev = df_eq_day[df_eq_day["date"] < today_date] if not df_eq_day.empty else pd.DataFrame()
+    df_eq_prev = df_eq_day[df_eq_day["date"] < today_date].copy() if not df_eq_day.empty else pd.DataFrame()
 
-    trend_df = df_eq_prev if len(df_eq_prev) >= 2 else df_fut_prev
+    trend_df = df_eq_prev if len(df_eq_prev) >= 20 else df_fut_prev
+    if len(trend_df) < 5:
+        return "FLAT", 0.0, 0.0, False, 0.0
 
-    if trend_df.empty:
-        df_1m = fetch_definedge_1m_df("NFO", fut_token, start_dt_day, now_ist)
-        df_1m_prev = df_1m[df_1m.index.date < today_date].between_time("09:15", "15:29")
-        if df_1m_prev.empty:
-            return "FLAT", 0.0, 0.0
-        trend_df = df_1m_prev.groupby(df_1m_prev.index.date).agg(
-            open=("open", "first"),
-            close=("close", "last")
-        ).dropna()
+    df_calc = trend_df.copy()
+    df_calc["body"] = (df_calc["open"] - df_calc["close"]).abs()
 
-    if trend_df.empty:
-        return "FLAT", 0.0, 0.0
+    yest_row = df_calc.iloc[-1]
+    yest_open = float(yest_row["open"])
+    yest_close = float(yest_row["close"])
+    yest_body = float(yest_row["body"])
 
-    yest_open = float(trend_df["open"].iloc[-1])
-    yest_close = float(trend_df["close"].iloc[-1])
+    avg_100d_body = float(df_calc["body"].tail(DAILY_ATR_PERIOD).mean())
 
-    if YESTERDAY_TREND_MODE.upper() == "CLOSE_VS_OPEN" or len(trend_df) < 2:
+    body_ratio = round(yest_body / avg_100d_body, 2) if avg_100d_body > 0 else 9.99
+    passes_body_filter = (avg_100d_body > 0) and (yest_body < (avg_100d_body * DAILY_BODY_ATR_MAX_MULT))
+
+    if YESTERDAY_TREND_MODE.upper() == "CLOSE_VS_OPEN" or len(df_calc) < 2:
         ref_base = yest_open
     else:
-        ref_base = float(trend_df["close"].iloc[-2])
+        ref_base = float(df_calc["close"].iloc[-2])
 
-    if not df_fut_prev.empty:
-        strike_ref_price = float(df_fut_prev["close"].iloc[-1])
-    else:
-        strike_ref_price = yest_close
-
+    strike_ref_price = float(df_fut_prev["close"].iloc[-1]) if not df_fut_prev.empty else yest_close
     if ref_base <= 0 or strike_ref_price <= 0:
-        return "FLAT", 0.0, 0.0
+        return "FLAT", 0.0, 0.0, False, 0.0
 
     pct_chg = round(((yest_close - ref_base) / ref_base) * 100.0, 2)
     if yest_close < ref_base:
-        return "DOWN", pct_chg, strike_ref_price
+        return "DOWN", pct_chg, strike_ref_price, passes_body_filter, body_ratio
     elif yest_close > ref_base:
-        return "UP", pct_chg, strike_ref_price
-    return "FLAT", 0.0, strike_ref_price
+        return "UP", pct_chg, strike_ref_price, passes_body_filter, body_ratio
+    return "FLAT", 0.0, strike_ref_price, False, body_ratio
+
+def build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist):
+    if not candidates:
+        return None
+
+    top_pool = [dict(c) for c in candidates[:TOP_N_OTM_POOL]]
+    start_dt_opt = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
+    best_cand = None
+    best_oi = -1.0
+    best_vol = -1.0
+
+    for c in top_pool:
+        df_opt_day = fetch_definedge_day_df("NFO", c["token"], start_dt_opt, now_ist)
+        df_opt_prev = df_opt_day[df_opt_day["date"] < today_date] if not df_opt_day.empty else pd.DataFrame()
+        if not df_opt_prev.empty:
+            yest_oi = float(df_opt_prev["oi"].iloc[-1])
+            yest_vol = float(df_opt_prev["volume"].iloc[-1])
+        else:
+            yest_oi, yest_vol = 0.0, 0.0
+
+        if (yest_oi > best_oi) or (yest_oi == best_oi and yest_vol > best_vol):
+            best_oi = yest_oi
+            best_vol = yest_vol
+            best_cand = dict(c)
+
+    if best_cand is None:
+        best_cand = dict(top_pool[0])
+
+    best_cand["otm_top3_pool"] = top_pool
+    return best_cand
 
 def build_basket_task(now_ist):
-    print("\n🎯 Building Filtered OTM Option Basket via Official Daily Candles (Down Yest -> CE | Up Yest -> PE)...")
+    print(
+        f"\n🎯 Building 100-Stock High-Beta OTM Basket "
+        f"(Filter: Yesterday Body < {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body | Top-{TOP_N_OTM_POOL} OTM OI Pool)..."
+    )
     get_definedge_session_key()
     eq_token_map, fut_map, options_by_stock = load_definedge_master_data()
-
     today_date = now_ist.date()
-    basket = []
-    ce_count, pe_count = 0, 0
 
-    for symbol in high_beta_50_stocks:
+    def evaluate_stock_for_basket(symbol):
         fut_info = fut_map.get(symbol)
         opt_chain = options_by_stock.get(symbol, [])
         eq_token = eq_token_map.get(symbol, "")
         if not fut_info or not opt_chain:
-            continue
+            return None
 
         try:
-            yest_dir, yest_pct, ref_price = get_yesterday_daily_stats(
+            yest_dir, yest_pct, ref_price, passes_body, body_ratio = get_yesterday_daily_stats(
                 eq_token, fut_info["token"], today_date, now_ist
             )
-            if yest_dir not in ("DOWN", "UP") or ref_price <= 0:
-                continue
+            if yest_dir not in ("DOWN", "UP") or ref_price <= 0 or not passes_body:
+                return None
 
-            selected_opt = None
             if yest_dir == "DOWN":
-                ce_candidates = sorted(
+                candidates = sorted(
                     [o for o in opt_chain if o["opt_type"] == "CE" and o["strike"] > ref_price],
                     key=lambda x: x["strike"]
                 )
-                if ce_candidates:
-                    selected_opt = dict(ce_candidates[0])
-                    ce_count += 1
-            elif yest_dir == "UP":
-                pe_candidates = sorted(
+            else:
+                candidates = sorted(
                     [o for o in opt_chain if o["opt_type"] == "PE" and o["strike"] < ref_price],
                     key=lambda x: x["strike"],
                     reverse=True
                 )
-                if pe_candidates:
-                    selected_opt = dict(pe_candidates[0])
-                    pe_count += 1
 
+            selected_opt = build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist)
             if selected_opt:
                 selected_opt["ref_fut_price"] = round(ref_price, 2)
                 selected_opt["yest_dir"] = yest_dir
                 selected_opt["yest_pct"] = yest_pct
+                selected_opt["body_atr_ratio"] = body_ratio
                 selected_opt["eq_token"] = eq_token
                 selected_opt["fut_token"] = fut_info["token"]
-                basket.append(selected_opt)
+                return selected_opt
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
+        return None
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(evaluate_stock_for_basket, high_beta_100_stocks))
+
+    basket = [r for r in results if r is not None]
+    ce_count = sum(1 for r in basket if r["opt_type"] == "CE")
+    pe_count = sum(1 for r in basket if r["opt_type"] == "PE")
 
     print(f"🎯 Basket Ready: {len(basket)} OTM Contracts ({ce_count} CEs + {pe_count} PEs).")
     return basket
 
 # ==============================================================================
-# 5. 15m RESAMPLING, ATR(2), OPT VOL & INVERTED UNDERLYING SLOT VOL
+# 5. 15m RESAMPLING (WITH LIVE OI), ATR(2), OPT VOL & UNDERLYING SLOT VOL
 # ==============================================================================
 def resample_to_15m(df_1m, now_ist):
     if df_1m.empty:
@@ -421,19 +469,23 @@ def resample_to_15m(df_1m, now_ist):
 
     resampled_chunks = []
     for _, group in df.groupby(df.index.date):
+        agg_dict = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }
+        if "oi" in group.columns:
+            agg_dict["oi"] = "last"
+
         bars = group.resample(
             "15min",
             origin="start_day",
             offset="9h15min",
             label="left",
             closed="left"
-        ).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna(subset=["open", "close"])
+        ).agg(agg_dict).dropna(subset=["open", "close"])
 
         bars = bars[bars.index.time <= dtime(15, 15)]
         resampled_chunks.append(bars)
@@ -497,6 +549,7 @@ def evaluate_15m_option_breakout(df_15m):
         return None
 
     signal_ts = cur_bar.name + timedelta(minutes=15)
+    cur_oi = int(float(cur_bar.get("oi", 0) or 0))
 
     return {
         "bar_ts": cur_bar.name,
@@ -505,10 +558,67 @@ def evaluate_15m_option_breakout(df_15m):
         "slot_hm": cur_bar.name.strftime("%H:%M"),
         "signal_hm": signal_ts.strftime("%H:%M"),
         "close": round(float(cur_bar["close"]), 2),
+        "low": round(float(cur_bar["low"]), 2),
+        "live_oi": cur_oi,
         "atr_ratio": round(cur_atr / prev_atr, 2),
         "vol": int(cur_vol),
         "vol_ratio": round(cur_vol / prev_vol, 2)
     }
+
+def resolve_highest_oi_strike_on_match(match_item, now_ist):
+    if not SELECT_HIGHEST_OI_ON_MATCH:
+        return match_item
+    top3_pool = match_item.get("otm_top3_pool", [])
+    if len(top3_pool) <= 1:
+        return match_item
+
+    target_bar_iso = match_item.get("bar_iso", "")
+    start_dt_short = IST.localize(datetime.combine(now_ist.date(), dtime(9, 15)))
+    if start_dt_short > now_ist:
+        start_dt_short = now_ist - timedelta(days=3)
+
+    def fetch_cand_live_snapshot(cand):
+        if cand["token"] == match_item["token"] and match_item.get("live_oi", 0) > 0:
+            return {
+                **cand,
+                "live_oi": int(match_item.get("live_oi", 0)),
+                "bar_close": float(match_item["close"]),
+                "bar_low": float(match_item["low"])
+            }
+        df_1m = fetch_definedge_1m_df("NFO", cand["token"], start_dt_short, now_ist)
+        if df_1m.empty:
+            return None
+        live_oi = int(float(df_1m["oi"].iloc[-1] or 0))
+        df_15m = resample_to_15m(df_1m, now_ist)
+        if df_15m.empty:
+            return None
+        if target_bar_iso:
+            bar_matches = df_15m[df_15m.index.strftime("%Y-%m-%d %H:%M") == target_bar_iso]
+            target_row = bar_matches.iloc[-1] if not bar_matches.empty else df_15m.iloc[-1]
+        else:
+            target_row = df_15m.iloc[-1]
+        b_close = round(float(target_row["close"]), 2)
+        b_low = round(float(target_row["low"]), 2)
+        if b_close <= 0 or b_low <= 0:
+            return None
+        return {**cand, "live_oi": live_oi, "bar_close": b_close, "bar_low": b_low}
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        snapshots = [s for s in executor.map(fetch_cand_live_snapshot, top3_pool) if s is not None]
+
+    if not snapshots:
+        return match_item
+
+    snapshots.sort(key=lambda x: x["live_oi"], reverse=True)
+    winner = snapshots[0]
+    updated = dict(match_item)
+    updated["token"] = winner["token"]
+    updated["trading_symbol"] = winner["trading_symbol"]
+    updated["strike"] = winner["strike"]
+    updated["close"] = winner["bar_close"]
+    updated["low"] = winner["bar_low"]
+    updated["live_oi"] = winner["live_oi"]
+    return updated
 
 def get_underlying_respective_slot_vol_ratio(opt, bar_ts, now_ist, memory):
     symbol = opt["underlying"]
@@ -607,11 +717,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     print(f"\n📊 {subject}\n{plain_body}\n")
 
     if not SENDER_EMAIL or not RECEIVER_EMAIL or not APP_PASSWORD:
-        print(
-            f"⚠️ Email credentials check -> SENDER: {'SET' if SENDER_EMAIL else 'MISSING'} | "
-            f"RECEIVER: {'SET' if RECEIVER_EMAIL else 'MISSING'} | "
-            f"APP_PASSWORD: {'SET' if APP_PASSWORD else 'MISSING (Check workflow .yml env section)'}. Skipping email dispatch."
-        )
+        print("⚠️ Email credentials missing. Skipping email dispatch.")
         return
 
     for attempt in range(1, 4):
@@ -632,7 +738,7 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 15m OTM Options Breakout Alert (Ranked by Und Slot Vol Ratio)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 15m OTM Options Breakout Alert (100-Stock | Body &lt; 0.67x 100d Avg Body | Top-3 OTM Highest OI)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>15m Bar:</strong> {bar_label} &nbsp;|&nbsp;
                     <strong>Basket Size:</strong> {total_tracked} Filtered OTM Options
@@ -743,7 +849,6 @@ def run_scanner(force_scan=False):
             latest_bar_seen = df_15m.index[-1].strftime("%Y-%m-%d %H:%M")
 
             if res:
-                # Strict Stale-Bar Guard (Matches Dhan Cloud 1-to-1)
                 if expected_bar_label and res["bar_iso"] != expected_bar_label:
                     continue
 
@@ -757,9 +862,11 @@ def run_scanner(force_scan=False):
                     "und_avg100_slot_vol": avg100_slot,
                     "und_today_slot_vol": today_slot
                 }
+                alert_item = resolve_highest_oi_strike_on_match(alert_item, now_ist)
                 triggered_alerts.append(alert_item)
                 print(
-                    f"  🔥 MATCH: {trd_sym} ({opt['opt_type']} | Slot {res['slot_hm']} -> Sig {res['signal_hm']} | "
+                    f"  🔥 MATCH: {alert_item['trading_symbol']} ({opt['opt_type']} | OI: {alert_item.get('live_oi', 0):,} | "
+                    f"Slot {res['slot_hm']} -> Sig {res['signal_hm']} | "
                     f"Und Slot Vol [Today/100dAvg]: {und_ratio:.2f}x | "
                     f"ATR Ratio: {res['atr_ratio']}x | Opt Vol: {res['vol_ratio']}x)"
                 )
@@ -811,7 +918,7 @@ def stay_awake_market_clock():
         or memory.get("basket_version") != BASKET_VERSION
         or not memory.get("options")
     ):
-        print("🌅 Pre-warming today's Official Daily Close OTM Option basket...")
+        print("🌅 Pre-warming today's 100-Stock Compressed-Body OTM Option basket...")
         new_basket = build_basket_task(now_ist)
         if new_basket:
             memory["basket_date"] = today_str
