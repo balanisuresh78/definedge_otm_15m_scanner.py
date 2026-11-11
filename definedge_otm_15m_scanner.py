@@ -47,7 +47,7 @@ APP_PASSWORD = (
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
-BASKET_VERSION = "v6_100stocks_100d_body_diff_top3_oi"
+BASKET_VERSION = "v7_leading_zero_date_fix"
 
 # Daily Filter (Yesterday Body < 0.67 * 100d Avg Body) & Top-3 OTM OI Settings
 YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
@@ -126,7 +126,7 @@ def save_memory(mem):
         print(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTHENTICATION & HISTORICAL DATA ENGINE (DAILY + 1M + OI)
+# 3. DEFINEDGE AUTHENTICATION & HISTORICAL DATA ENGINE (LEADING-0 SAFE)
 # ==============================================================================
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -170,21 +170,25 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
             if resp.status_code != 200 or not resp.text.strip():
                 return pd.DataFrame()
 
+            # CRITICAL FIX: dtype=str preserves leading '0' on days 01..09 of the month!
             df = pd.read_csv(
                 io.StringIO(resp.text.strip()),
                 header=None,
-                names=["datetime", "open", "high", "low", "close", "volume", "oi"]
+                names=["datetime", "open", "high", "low", "close", "volume", "oi"],
+                dtype=str
             )
             if df.empty:
                 return pd.DataFrame()
 
-            raw_d = df["datetime"].astype(str).str.strip().str.slice(0, 8)
+            raw_dt = df["datetime"].astype(str).str.strip().str.zfill(12)
+            raw_d = raw_dt.str.slice(0, 8)
             df["date"] = pd.to_datetime(raw_d, format="%d%m%Y", errors="coerce").dt.date
             df = df.dropna(subset=["date"]).sort_values("date")
 
             for col in ["open", "high", "low", "close", "volume", "oi"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df["oi"] = df["oi"].fillna(0)
+            df["volume"] = df["volume"].fillna(0)
             df = df.dropna(subset=["open", "high", "low", "close"]).drop_duplicates(subset=["date"], keep="last")
             return df
         except Exception as e:
@@ -210,12 +214,14 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
             df = pd.read_csv(
                 io.StringIO(resp.text.strip()),
                 header=None,
-                names=["datetime", "open", "high", "low", "close", "volume", "oi"]
+                names=["datetime", "open", "high", "low", "close", "volume", "oi"],
+                dtype=str
             )
             if df.empty:
                 return pd.DataFrame()
 
-            df["datetime"] = pd.to_datetime(df["datetime"].astype(str), format="%d%m%Y%H%M", errors="coerce")
+            raw_dt = df["datetime"].astype(str).str.strip().str.zfill(12)
+            df["datetime"] = pd.to_datetime(raw_dt, format="%d%m%Y%H%M", errors="coerce")
             df = df.dropna(subset=["datetime"])
             df["datetime"] = df["datetime"].dt.tz_localize(IST)
             df = df.set_index("datetime").sort_index()
@@ -223,6 +229,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
             for col in ["open", "high", "low", "close", "volume", "oi"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df["oi"] = df["oi"].fillna(0)
+            df["volume"] = df["volume"].fillna(0)
             return df.dropna(subset=["open", "close"])
         except Exception as e:
             if attempt == 2:
@@ -231,7 +238,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     return pd.DataFrame()
 
 # ==============================================================================
-# 4. MASTER PARSING, 100-DAY AVG BODY FILTER & TOP-3 OTM POOL BUILDER
+# 4. MASTER PARSING, 100-DAY AVG BODY FILTER & TOP-3 OTM HIGHEST-OI BUILDER
 # ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
@@ -293,7 +300,7 @@ def load_definedge_master_data():
 
     for exp_col in [5, 8, 6, 7]:
         if exp_col in nfo.columns:
-            parsed = pd.to_datetime(nfo[exp_col], format="%d%m%Y", errors="coerce")
+            parsed = pd.to_datetime(nfo[exp_col].str.strip().str.zfill(8), format="%d%m%Y", errors="coerce")
             if parsed.notna().sum() > 0:
                 nfo["expiry"] = parsed.dt.date
                 break
@@ -373,8 +380,13 @@ def build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist):
     if not candidates:
         return None
 
-    top_pool = [dict(c) for c in candidates[:TOP_N_OTM_POOL]]
-    start_dt_opt = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
+    top_pool = []
+    for idx, cand in enumerate(candidates[:TOP_N_OTM_POOL]):
+        c = dict(cand)
+        c["otm_rank"] = idx + 1
+        top_pool.append(c)
+
+    start_dt_opt = (now_ist - timedelta(days=15)).replace(hour=9, minute=15, second=0, microsecond=0)
     best_cand = None
     best_oi = -1.0
     best_vol = -1.0
@@ -387,6 +399,9 @@ def build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist):
             yest_vol = float(df_opt_prev["volume"].iloc[-1])
         else:
             yest_oi, yest_vol = 0.0, 0.0
+
+        c["yest_oi"] = int(max(0, yest_oi))
+        c["yest_vol"] = int(max(0, yest_vol))
 
         if (yest_oi > best_oi) or (yest_oi == best_oi and yest_vol > best_vol):
             best_oi = yest_oi
@@ -402,7 +417,7 @@ def build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist):
 def build_basket_task(now_ist):
     print(
         f"\n🎯 Building 100-Stock High-Beta OTM Basket "
-        f"(Filter: Yesterday Body < {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body | Top-{TOP_N_OTM_POOL} OTM OI Pool)..."
+        f"(Filter: Yesterday Body < {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body | Top-{TOP_N_OTM_POOL} OTM Highest OI)..."
     )
     get_definedge_session_key()
     eq_token_map, fut_map, options_by_stock = load_definedge_master_data()
@@ -573,22 +588,20 @@ def resolve_highest_oi_strike_on_match(match_item, now_ist):
         return match_item
 
     target_bar_iso = match_item.get("bar_iso", "")
-    start_dt_short = IST.localize(datetime.combine(now_ist.date(), dtime(9, 15)))
-    if start_dt_short > now_ist:
-        start_dt_short = now_ist - timedelta(days=3)
+    start_dt_short = (now_ist - timedelta(days=5)).replace(hour=9, minute=15, second=0, microsecond=0)
 
     def fetch_cand_live_snapshot(cand):
         if cand["token"] == match_item["token"] and match_item.get("live_oi", 0) > 0:
             return {
                 **cand,
-                "live_oi": int(match_item.get("live_oi", 0)),
+                "live_oi": int(max(match_item.get("live_oi", 0), cand.get("yest_oi", 0))),
                 "bar_close": float(match_item["close"]),
                 "bar_low": float(match_item["low"])
             }
         df_1m = fetch_definedge_1m_df("NFO", cand["token"], start_dt_short, now_ist)
         if df_1m.empty:
             return None
-        live_oi = int(float(df_1m["oi"].iloc[-1] or 0))
+        live_oi = int(max(float(df_1m["oi"].iloc[-1] or 0), float(cand.get("yest_oi", 0) or 0)))
         df_15m = resample_to_15m(df_1m, now_ist)
         if df_15m.empty:
             return None
@@ -691,10 +704,11 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
     headers = [
-        "Stock (Yest %)",
-        "Option Symbol",
+        "Stock (Yest % | Body/100dBody)",
+        "Option Symbol (Live OI)",
         "15m Slot (Sig)",
         "Close",
+        "15m Low",
         "ATR Ratio",
         "Opt Vol Ratio",
         "Und Slot Vol Ratio (Today/100dAvg)"
@@ -702,10 +716,11 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
 
     table_rows = [
         [
-            f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}%)",
-            m["trading_symbol"],
+            f"{m['underlying']} ({m.get('yest_pct', 0):+.1f}% | {m.get('body_atr_ratio', 0):.2f}x)",
+            f"{m['trading_symbol']} ({m.get('live_oi', 0):,})",
             f"{m['slot_hm']} ({m.get('signal_hm', '')})",
             f"{m['close']:.2f}",
+            f"{m.get('low', 0):.2f}",
             f"{m['atr_ratio']:.2f}x",
             f"{m['vol_ratio']:.2f}x ({m['vol']:,})",
             f"{m.get('und_vol_ratio', 0):.2f}x ({m.get('und_today_slot_vol', 0):,}/{m.get('und_avg100_slot_vol', 0):,})"
@@ -867,6 +882,7 @@ def run_scanner(force_scan=False):
                 print(
                     f"  🔥 MATCH: {alert_item['trading_symbol']} ({opt['opt_type']} | OI: {alert_item.get('live_oi', 0):,} | "
                     f"Slot {res['slot_hm']} -> Sig {res['signal_hm']} | "
+                    f"Close: {alert_item['close']} | 15m Low: {alert_item['low']} | "
                     f"Und Slot Vol [Today/100dAvg]: {und_ratio:.2f}x | "
                     f"ATR Ratio: {res['atr_ratio']}x | Opt Vol: {res['vol_ratio']}x)"
                 )
@@ -918,7 +934,7 @@ def stay_awake_market_clock():
         or memory.get("basket_version") != BASKET_VERSION
         or not memory.get("options")
     ):
-        print("🌅 Pre-warming today's 100-Stock Compressed-Body OTM Option basket...")
+        print("🌅 Pre-warming today's 100-Stock Compressed-Body OTM Option basket (v7 Leading-0 Date Fix)...")
         new_basket = build_basket_task(now_ist)
         if new_basket:
             memory["basket_date"] = today_str
