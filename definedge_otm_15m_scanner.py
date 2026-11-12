@@ -47,13 +47,21 @@ APP_PASSWORD = (
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "otm_15m_memory.json"
-BASKET_VERSION = "v7_leading_zero_date_fix"
+BASKET_VERSION = "v8_fut_trend_spot_body_paytm"
 
-# Daily Filter (Yesterday Body < 0.67 * 100d Avg Body) & Top-3 OTM OI Settings
-YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"
-DAILY_ATR_PERIOD = 100
-DAILY_BODY_ATR_MAX_MULT = 0.67
-DAILY_100D_BASELINE_MODE = "BODY_DIFF"
+# ==============================================================================
+# DAILY BASKET FILTER (FUTURES TREND + SPOT 100d AVG BODY) & TOP-3 OTM OI
+# ==============================================================================
+# 1. Trend Direction: Futures Yesterday Close < Futures Previous Close (NOT red candle)
+YESTERDAY_TREND_SOURCE = "FUTURES"            # Uses Official Futures Daily Close vs Prev Close
+YESTERDAY_TREND_MODE = "CLOSE_VS_PREV_CLOSE"  # Strictly Close < Prev Close
+
+# 2. Body Compression: Spot Yesterday |Open - Close| < 0.67 * Spot 100d Avg |Open - Close|
+DAILY_BODY_SOURCE = "SPOT"                    # Uses NSE Cash Spot Daily Candles (avoids Futures spikes)
+DAILY_ATR_PERIOD = 100                        # 100-day lookback on Official Spot Daily Candles
+DAILY_BODY_ATR_MAX_MULT = 0.67                # Yesterday's Spot |Open - Close| < 0.67 * 100d Avg Spot Body
+
+# 3. Top-3 OTM Highest Open Interest Selection
 TOP_N_OTM_POOL = 3
 SELECT_HIGHEST_OI_ON_MATCH = True
 
@@ -77,14 +85,17 @@ SCAN_CHECKPOINTS_IST = [
     dtime(15, 30, 12)
 ]
 
+# ==============================================================================
+# HIGH-BETA NSE F&O STOCK UNIVERSE (WITH ETERNAL, TMPV, NYKAA & PAYTM)
+# ==============================================================================
 high_beta_100_stocks = [
     # Banking & High-Beta Financials (22)
     "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
     "FEDERALBNK", "HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDUSINDBK", "KOTAKBANK",
     "PNB", "RBLBANK", "SBIN", "SHRIRAMFIN", "AUBANK", "BANDHANBNK",
     "ABCAPITAL", "LICHSGFIN", "LTF", "MANAPPURAM",
-    # Capital Markets, Fintech & Insurance (8)
-    "ANGELONE", "BSE", "CDSL", "MCX", "CAMS", "HDFCAMC", "JIOFIN", "MUTHOOTFIN",
+    # Capital Markets, Fintech & Insurance (9) -> Added PAYTM
+    "ANGELONE", "BSE", "CDSL", "MCX", "CAMS", "HDFCAMC", "JIOFIN", "MUTHOOTFIN", "PAYTM",
     # Defence, Railways, PSU & Power/Energy (20)
     "BDL", "BEL", "BHEL", "HAL", "IRFC", "MAZDOCK", "PFC", "RECLTD",
     "TATAPOWER", "JSWENERGY", "NTPC", "POWERGRID", "COALINDIA", "ONGC",
@@ -95,7 +106,7 @@ high_beta_100_stocks = [
     # Metals, Mining & Adani Pack (11)
     "ADANIENT", "ADANIPORTS", "ADANIGREEN", "ADANIENSOL", "HINDALCO",
     "JINDALSTEL", "JSWSTEEL", "TATASTEEL", "VEDL", "NMDC", "NATIONALUM",
-    # Auto, Retail, Aviation, Telecom & New-Age (14) -> TMPV, ETERNAL & NYKAA updated
+    # Auto, Retail, Aviation, Telecom & New-Age (14) -> TMPV, ETERNAL & NYKAA
     "BAJAJ-AUTO", "M&M", "MARUTI", "MOTHERSON", "TMPV", "TVSMOTOR",
     "EICHERMOT", "ASHOKLEY", "TRENT", "ETERNAL", "NYKAA", "BHARTIARTL", "INDIGO", "INDUSTOWER",
     # High-Beta IT, Realty, Infra & Pharma (14)
@@ -177,7 +188,6 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
             if resp.status_code != 200 or not resp.text.strip():
                 return pd.DataFrame()
 
-            # CRITICAL FIX: dtype=str preserves leading '0' on days 01..09 of the month!
             df = pd.read_csv(
                 io.StringIO(resp.text.strip()),
                 header=None,
@@ -245,7 +255,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     return pd.DataFrame()
 
 # ==============================================================================
-# 4. MASTER PARSING, 100-DAY AVG BODY FILTER & TOP-3 OTM HIGHEST-OI BUILDER
+# 4. MASTER PARSING, FUTURES TREND + SPOT 100d BODY FILTER & TOP-3 OTM BUILDER
 # ==============================================================================
 def extract_strike_and_type_from_row(row, underlying, trading_symbol):
     opt_type = str(row[8]).strip().upper() if 8 in row.index and pd.notna(row[8]) else ""
@@ -342,35 +352,48 @@ def load_definedge_master_data():
     return eq_token_map, fut_map, options_by_stock
 
 def get_yesterday_daily_stats(eq_token, fut_token, today_date, now_ist):
-    start_dt_day = (now_ist - timedelta(days=LOOKBACK_DAYS_DAILY)).replace(hour=9, minute=15, second=0, microsecond=0)
+    """
+    Split Daily Evaluation (Synced 1-to-1 with Dhan Cloud):
+      1. Trend Direction (DOWN / UP) & Strike Reference Price:
+         Uses Official FUTURES Daily Candles (Yesterday's Futures Close vs Previous Day's Futures Close).
+      2. Candle Body Compression (< 0.67 * 100-Day Avg Body):
+         Uses Official SPOT (NSE Cash) Daily Candles over 100 days to avoid far-month Futures spikes.
+    """
+    start_dt_spot = (now_ist - timedelta(days=LOOKBACK_DAYS_DAILY)).replace(hour=9, minute=15, second=0, microsecond=0)
+    start_dt_fut = (now_ist - timedelta(days=25)).replace(hour=9, minute=15, second=0, microsecond=0)
 
-    df_fut_day = fetch_definedge_day_df("NFO", fut_token, start_dt_day, now_ist)
+    # 1. Fetch Futures Daily Candles (for Trend Direction & Strike Selection Reference)
+    df_fut_day = fetch_definedge_day_df("NFO", fut_token, start_dt_fut, now_ist)
     df_fut_prev = df_fut_day[df_fut_day["date"] < today_date].copy() if not df_fut_day.empty else pd.DataFrame()
 
-    df_eq_day = fetch_definedge_day_df("NSE", eq_token, start_dt_day, now_ist) if eq_token else pd.DataFrame()
+    # 2. Fetch Spot (NSE Cash) Daily Candles (for 100-Day Average Body Compression)
+    df_eq_day = fetch_definedge_day_df("NSE", eq_token, start_dt_spot, now_ist) if eq_token else pd.DataFrame()
     df_eq_prev = df_eq_day[df_eq_day["date"] < today_date].copy() if not df_eq_day.empty else pd.DataFrame()
 
-    trend_df = df_eq_prev if len(df_eq_prev) >= 20 else df_fut_prev
-    if len(trend_df) < 5:
+    # Evaluate 100-Day Body Compression strictly on Spot (fallback to Futures only if Spot unavailable)
+    body_df = df_eq_prev if len(df_eq_prev) >= 20 else df_fut_prev
+    if len(body_df) < 5:
         return "FLAT", 0.0, 0.0, False, 0.0
 
-    df_calc = trend_df.copy()
-    df_calc["body"] = (df_calc["open"] - df_calc["close"]).abs()
+    body_df["body"] = (body_df["open"] - body_df["close"]).abs()
+    yest_spot_body = float(body_df["body"].iloc[-1])
+    avg_100d_spot_body = float(body_df["body"].tail(DAILY_ATR_PERIOD).mean())
 
-    yest_row = df_calc.iloc[-1]
-    yest_open = float(yest_row["open"])
-    yest_close = float(yest_row["close"])
-    yest_body = float(yest_row["body"])
+    body_ratio = round(yest_spot_body / avg_100d_spot_body, 2) if avg_100d_spot_body > 0 else 9.99
+    passes_body_filter = (avg_100d_spot_body > 0) and (yest_spot_body < (avg_100d_spot_body * DAILY_BODY_ATR_MAX_MULT))
 
-    avg_100d_body = float(df_calc["body"].tail(DAILY_ATR_PERIOD).mean())
-
-    body_ratio = round(yest_body / avg_100d_body, 2) if avg_100d_body > 0 else 9.99
-    passes_body_filter = (avg_100d_body > 0) and (yest_body < (avg_100d_body * DAILY_BODY_ATR_MAX_MULT))
-
-    if YESTERDAY_TREND_MODE.upper() == "CLOSE_VS_OPEN" or len(df_calc) < 2:
-        ref_base = yest_open
+    # Evaluate Yesterday's Trend Direction (Yesterday Close vs Previous Close) on Futures
+    if YESTERDAY_TREND_SOURCE.upper() == "FUTURES" and len(df_fut_prev) >= 2:
+        trend_df = df_fut_prev
     else:
-        ref_base = float(df_calc["close"].iloc[-2])
+        trend_df = body_df
+
+    if len(trend_df) < 2:
+        return "FLAT", 0.0, 0.0, False, 0.0
+
+    yest_close = float(trend_df["close"].iloc[-1])
+    yest_open = float(trend_df["open"].iloc[-1])
+    ref_base = yest_open if YESTERDAY_TREND_MODE.upper() == "CLOSE_VS_OPEN" else float(trend_df["close"].iloc[-2])
 
     strike_ref_price = float(df_fut_prev["close"].iloc[-1]) if not df_fut_prev.empty else yest_close
     if ref_base <= 0 or strike_ref_price <= 0:
@@ -423,8 +446,8 @@ def build_top3_otm_pool_and_pick_highest_oi(candidates, today_date, now_ist):
 
 def build_basket_task(now_ist):
     print(
-        f"\n🎯 Building 100-Stock High-Beta OTM Basket "
-        f"(Filter: Yesterday Body < {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body | Top-{TOP_N_OTM_POOL} OTM Highest OI)..."
+        f"\n🎯 Building {len(high_beta_100_stocks)}-Stock High-Beta OTM Basket "
+        f"(Trend: Futures Close<PrevClose | Body: Spot < {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body | Top-{TOP_N_OTM_POOL} OTM Highest OI)..."
     )
     get_definedge_session_key()
     eq_token_map, fut_map, options_by_stock = load_definedge_master_data()
@@ -435,14 +458,16 @@ def build_basket_task(now_ist):
         opt_chain = options_by_stock.get(symbol, [])
         eq_token = eq_token_map.get(symbol, "")
         if not fut_info or not opt_chain:
-            return None
+            return None, False
 
         try:
             yest_dir, yest_pct, ref_price, passes_body, body_ratio = get_yesterday_daily_stats(
                 eq_token, fut_info["token"], today_date, now_ist
             )
-            if yest_dir not in ("DOWN", "UP") or ref_price <= 0 or not passes_body:
-                return None
+            if yest_dir not in ("DOWN", "UP") or ref_price <= 0:
+                return None, False
+            if not passes_body:
+                return None, True
 
             if yest_dir == "DOWN":
                 candidates = sorted(
@@ -464,19 +489,39 @@ def build_basket_task(now_ist):
                 selected_opt["body_atr_ratio"] = body_ratio
                 selected_opt["eq_token"] = eq_token
                 selected_opt["fut_token"] = fut_info["token"]
-                return selected_opt
+                return selected_opt, False
         except Exception as e:
             print(f"  ⚠️ Error selecting OTM option for {symbol}: {e}")
-        return None
+        return None, False
+
+    basket = []
+    ce_count, pe_count = 0, 0
+    skipped_by_body = 0
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         results = list(executor.map(evaluate_stock_for_basket, high_beta_100_stocks))
 
-    basket = [r for r in results if r is not None]
-    ce_count = sum(1 for r in basket if r["opt_type"] == "CE")
-    pe_count = sum(1 for r in basket if r["opt_type"] == "PE")
+    for selected_opt, was_skipped_by_body in results:
+        if was_skipped_by_body:
+            skipped_by_body += 1
+        elif selected_opt:
+            if selected_opt["opt_type"] == "CE":
+                ce_count += 1
+            else:
+                pe_count += 1
+            basket.append(selected_opt)
 
-    print(f"🎯 Basket Ready: {len(basket)} OTM Contracts ({ce_count} CEs + {pe_count} PEs).")
+    print(
+        f"🎯 Basket Ready: {len(basket)} OTM Contracts ({ce_count} CEs + {pe_count} PEs, each locked to Top-{TOP_N_OTM_POOL} Highest OI) | "
+        f"Filtered out {skipped_by_body} stocks with Spot Body >= {DAILY_BODY_ATR_MAX_MULT}x 100d Avg Body."
+    )
+
+    ce_watchlist = [
+        f"{o['underlying']}->{o['trading_symbol']} (Fut:{o.get('yest_pct', 0):+.1f}% | SpotBody:{o.get('body_atr_ratio', 0):.2f}x | OI:{o.get('yest_oi', 0):,})"
+        for o in basket if o["opt_type"] == "CE"
+    ]
+    print(f"📋 Today's CE Watchlist ({len(ce_watchlist)}): {', '.join(ce_watchlist) or 'None'}")
+
     return basket
 
 # ==============================================================================
@@ -696,7 +741,7 @@ def get_underlying_respective_slot_vol_ratio(opt, bar_ts, now_ist, memory):
 # ==============================================================================
 # 6. 15px LARGE-FONT HTML EMAIL SENDER (SORTED BY UND SLOT VOL RATIO)
 # ==============================================================================
-def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
+def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked, options_list=None):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
     subject = f"⚡ 15m OTM Options Breakout ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
@@ -710,8 +755,11 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
     ce_all = ", ".join([m["trading_symbol"] for m in ce_matches]) or "None"
     pe_all = ", ".join([m["trading_symbol"] for m in pe_matches]) or "None"
 
+    ce_basket_all = [o["trading_symbol"] for o in (options_list or []) if o.get("opt_type") == "CE"]
+    ce_basket_str = ", ".join(ce_basket_all) or "None"
+
     headers = [
-        "Stock (Yest % | Body/100dBody)",
+        "Stock (Fut % | SpotBody/100d)",
         "Option Symbol (Live OI)",
         "15m Slot (Sig)",
         "Close",
@@ -760,18 +808,19 @@ def send_otm_15m_email_alert(triggered_list, bar_label, total_tracked):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 15m OTM Options Breakout Alert (100-Stock | Body &lt; 0.67x 100d Avg Body | Top-3 OTM Highest OI)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 15m OTM Options Breakout Alert (Futures Trend + Spot Body &lt; 0.67x 100d Avg + Top-3 OTM Highest OI)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>15m Bar:</strong> {bar_label} &nbsp;|&nbsp;
-                    <strong>Basket Size:</strong> {total_tracked} Filtered OTM Options
+                    <strong>Basket Size:</strong> {total_tracked} Filtered OTM Options ({len(ce_basket_all)} CEs)
                 </p>
                 <p style="margin:0 0 4px 0;"><strong>📋 OTM CALLS (CE - Ranked by Und Slot Vol Ratio) - Top 5:</strong></p>
                 <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{ce_top5}</pre>
                 <p style="margin:0 0 4px 0;"><strong>📋 OTM PUTS (PE - Ranked by Und Slot Vol Ratio) - Top 5:</strong></p>
                 <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{pe_top5}</pre>
                 <p style="margin:0 0 14px 0;font-size:14px;color:#334155;">
-                    <strong>All CE ({len(ce_matches)}):</strong> {ce_all}<br>
-                    <strong>All PE ({len(pe_matches)}):</strong> {pe_all}
+                    <strong>All Triggered CE ({len(ce_matches)}):</strong> {ce_all}<br>
+                    <strong>All Triggered PE ({len(pe_matches)}):</strong> {pe_all}<br>
+                    <strong>Today's Full CE Watchlist ({len(ce_basket_all)}):</strong> {ce_basket_str}
                 </p>
                 <div style="overflow-x:auto;">
                     <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
@@ -903,7 +952,7 @@ def run_scanner(force_scan=False):
     save_memory(memory)
 
     if triggered_alerts:
-        send_otm_15m_email_alert(triggered_alerts, expected_bar_label or latest_bar_seen, len(options_list))
+        send_otm_15m_email_alert(triggered_alerts, expected_bar_label or latest_bar_seen, len(options_list), options_list)
     else:
         print(f"ℹ️ No 15m OTM Options matched on bar [{expected_bar_label or latest_bar_seen}].")
 
@@ -941,7 +990,7 @@ def stay_awake_market_clock():
         or memory.get("basket_version") != BASKET_VERSION
         or not memory.get("options")
     ):
-        print("🌅 Pre-warming today's 100-Stock Compressed-Body OTM Option basket (v7 Leading-0 Date Fix)...")
+        print("🌅 Pre-warming today's High-Beta OTM Option basket (v8 Futures Trend + Spot 100d Body)...")
         new_basket = build_basket_task(now_ist)
         if new_basket:
             memory["basket_date"] = today_str
