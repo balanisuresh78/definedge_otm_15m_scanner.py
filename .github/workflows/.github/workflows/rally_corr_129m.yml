@@ -1,0 +1,68 @@
+name: 129m WRB Rally + Slow Correction Scanner
+
+on:
+  schedule:
+    # Starts at 11:00 AM IST (05:30 UTC) Mon-Fri and stays awake through 11:24, 13:33, and 15:30 IST
+    - cron: '30 5 * * 1-5'
+    # Fail-safe backup triggers before the 13:33 IST and 15:30 IST bars (ignored if main clock is already running)
+    - cron: '48 7 * * 1-5'
+    - cron: '45 9 * * 1-5'
+  workflow_dispatch:
+
+# Prevents duplicate runners if the 11:00 AM IST stay-awake job is already active
+concurrency:
+  group: rally-corr-129m-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan-129m-rally-correction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore rally_corr_129m_memory.json from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: rally_corr_129m_memory.json
+          key: rally-corr-129m-mem-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            rally-corr-129m-mem-${{ runner.os }}-
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy pyotp pytz tabulate
+
+      - name: Run 129m WRB Rally + Slow Correction Clock
+        env:
+          TZ: Asia/Kolkata
+          DEFINEDGE_API_TOKEN: ${{ secrets.DEFINEDGE_API_TOKEN }}
+          DEFINEDGE_API_SECRET: ${{ secrets.DEFINEDGE_API_SECRET }}
+          DEFINEDGE_TOTP_SECRET: ${{ secrets.DEFINEDGE_TOTP_SECRET }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: |
+          python definedge_129m_rally_correction_scanner.py
+
+      - name: Save rally_corr_129m_memory.json to Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: rally_corr_129m_memory.json
+          key: rally-corr-129m-mem-${{ runner.os }}-${{ github.run_id }}
