@@ -48,26 +48,35 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "rally_corr_129m_memory.json"
 
 # ==============================================================================
-# 129-MINUTE IMPULSE RALLY + SLOW TIME-CORRECTION PARAMETERS
+# 129-MINUTE "JUST STARTED RALLYING + SLOW TIME-CORRECTION" PARAMETERS
 # ==============================================================================
-DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash) or "NFO" (Current Month Futures)
+DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash) or "NFO" (Near-Month Futures)
 ATR_FAST_PERIOD = 2                   # ATR(2) for Wide-Range Bar thrust check
-ATR_SLOW_PERIOD = 100                 # ATR(100) baseline for small-body & rally height
+ATR_SLOW_PERIOD = 100                 # ATR(100) baseline for WRB & small-body checks
 ATR_METHOD = "SMA"                    # "SMA" or "RMA"
 
-# Phase 1: Impulse Rally Rules
-WRB_ATR2_MULT = 1.5                   # At least 1 rally bar must have ATR(2) >= 1.5x Prev ATR(2)
-MIN_WRB_COUNT_IN_RALLY = 1            # Minimum wide-range bullish bars in the rally
-MAX_DOWN_BARS_IN_RALLY = 3            # Max 1, 2, or 3 small-body corrective down bars allowed in rally
-SMALL_DOWN_BODY_ATR100_MAX = 0.67     # Down bar body inside rally must be <= 0.67 * ATR(100)
-SMALL_DOWN_BODY_VS_UP_MAX = 0.55      # Down bar body inside rally must be <= 55% of max bullish rally body
-MIN_RALLY_BARS = 1                    # Minimum bars in the impulsive rally
-MAX_RALLY_BARS = 12                   # Maximum bars in the impulsive rally
-MIN_RALLY_RANGE_ATR100 = 1.5          # Total rally height (Peak High - Start Low) >= 1.5x ATR(100)
+# Phase 0: "Just Started Rallying" (Prior Base / Low Context)
+PRIOR_BASE_LOOKBACK = 20              # Bars prior to rally start used to verify stock launched from a base/low
+MAX_START_POS_IN_PRIOR_BASE = 0.45    # Rally Start Low must be in the bottom 45% of the prior 20-bar range
+PRIOR_HIGH_CEILING_RATIO = 0.65       # Prior 15 bars before rally must not have exceeded 65% of the new rally height
 
-# Phase 2: Slow Correction Rules (Time Ratio = Correction Bars / Rally Bars > 1.0)
-MAX_CORRECTION_BARS = 35              # Max bars to scan for an active correction
-MAX_RETRACEMENT_OF_RALLY = 0.85       # Correction Low must stay strictly above Rally Start Low (<= 85% retracement)
+# Phase 1: Impulse Rally Rules (True Full-Leg Base-to-Peak)
+WRB_ATR2_PREV_MULT = 1.5              # Rally WRB must have ATR(2) >= 1.5x Previous Bar's ATR(2)
+WRB_ATR2_VS_ATR100_MIN = 1.35         # Rally WRB must have ATR(2) >= 1.35x ATR(100) (spikes above ATR 100 line)
+WRB_BODY_VS_ATR100_MIN = 1.0          # Rally WRB bullish body |Close - Open| >= 1.0x ATR(100)
+MIN_WRB_COUNT_IN_RALLY = 1            # At least 1 wide-range bullish thrust bar in the rally
+MAX_DOWN_BARS_IN_RALLY = 3            # Allow 0, 1, 2, or max 3 small-body corrective down bars inside rally
+SMALL_DOWN_BODY_ATR100_MAX = 0.67     # Down bar body inside rally must be <= 0.67 * ATR(100)
+SMALL_DOWN_BODY_VS_UP_MAX = 0.45      # Down bar body inside rally must be <= 45% of max bullish rally body
+MIN_RALLY_BARS = 2                    # Minimum bars in the full impulse rally leg
+MAX_RALLY_BARS = 10                   # Maximum bars in the full impulse rally leg
+MIN_RALLY_RANGE_ATR100 = 2.8          # Total rally height (Peak High - Start Low) >= 2.8x ATR(100)
+
+# Phase 2: Slow Time-Correction Rules (Correction Time > Rally Time)
+MAX_CORRECTION_BARS = 35              # Max bars to look back for the rally peak
+MIN_RETRACEMENT_OF_RALLY = 0.20       # Must pull back at least 20% from peak (actual correction, not flat top)
+MAX_RETRACEMENT_OF_RALLY = 0.78       # Correction Low must hold well above Rally Start Low (<= 78% retracement)
+MAX_CORR_AVG_BODY_VS_RALLY = 0.65     # Avg body in correction must be < 65% of avg body in rally (slow pullback)
 
 # Lookback (~95 calendar days = ~195 bars of 129m data for accurate ATR(100))
 LOOKBACK_DAYS_1M = 95
@@ -307,7 +316,9 @@ def compute_indicators_129m(df_129m):
 
     df["prev_atr2"] = df["atr2"].shift(1)
     df["atr2_ratio"] = np.where(df["prev_atr2"] > 0, df["atr2"] / df["prev_atr2"], 0.0)
+    df["atr2_vs_100"] = np.where(df["atr100"] > 0, df["atr2"] / df["atr100"], 0.0)
     df["body"] = (df["close"] - df["open"]).abs()
+    df["body_vs_100"] = np.where(df["atr100"] > 0, df["body"] / df["atr100"], 0.0)
 
     # Stochastic (5, 3, 3)
     low_5 = df["low"].rolling(5, min_periods=5).min()
@@ -316,26 +327,66 @@ def compute_indicators_129m(df_129m):
     df["stoch_k"] = pd.Series(fast_k, index=df.index).rolling(3, min_periods=3).mean()
     df["stoch_d"] = df["stoch_k"].rolling(3, min_periods=3).mean()
 
-    # Bullish Wide-Range Bar (WRB): Bullish candle + ATR(2) >= 1.5x Prev ATR(2)
+    # True Bullish Wide-Range Bar (WRB):
+    # 1. Bullish bar (Close > Open and Close > Prev Close)
+    # 2. ATR(2) >= 1.5x Previous ATR(2)
+    # 3. ATR(2) >= 1.35x ATR(100) (blue ATR 2 line spikes above black ATR 100 line)
+    # 4. Bullish candle body >= 1.0x ATR(100)
     df["is_bull_wrb"] = (
         (df["close"] > df["open"])
         & (df["close"] > prev_close)
-        & (df["atr2_ratio"] >= WRB_ATR2_MULT)
+        & (df["atr2_ratio"] >= WRB_ATR2_PREV_MULT)
+        & (df["atr2_vs_100"] >= WRB_ATR2_VS_ATR100_MIN)
+        & (df["body_vs_100"] >= WRB_BODY_VS_ATR100_MIN)
     )
     return df
 
 # ==============================================================================
-# 5. PATTERN DETECTOR: WRB IMPULSE RALLY + SLOWER TIME-CORRECTION ABOVE BASE
+# 5. PATTERN DETECTOR: FRESH IMPULSE RALLY FROM BASE + SLOWER TIME-CORRECTION
 # ==============================================================================
-def check_rally_and_correction_window(df, start_idx, peak_idx, end_corr_idx):
+def find_true_rally_start_idx(df, peak_idx):
     """
-    Validates whether [start_idx .. peak_idx] is a valid WRB Impulse Rally
-    and [peak_idx + 1 .. end_corr_idx] is a valid Slow Time-Correction:
-      1. Rally has >= 1 Bullish WRB (ATR(2) >= 1.5x previous bar ATR(2)).
-      2. Rally has 0, 1, 2, or max 3 small-body corrective down bars.
-      3. Correction consumes strictly MORE time than the rally (corr_bars > rally_bars).
-      4. Correction stays strictly above the starting point of the rally.
+    Finds the true structural starting bar of the rally ending at `peak_idx`
+    so the scanner NEVER slices just the top 1-2 bars of a longer move:
+      - Walks backward up to MAX_RALLY_BARS from `peak_idx` to locate the lowest
+        swing low (`min_low_idx`) and the first bullish launch bar (`start_idx`).
     """
+    search_from = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
+    if search_from >= peak_idx:
+        return None
+
+    window = df.iloc[search_from : peak_idx + 1]
+    min_low_val = float(window["low"].min())
+
+    # Positional index of the lowest low inside [search_from .. peak_idx]
+    rel_min_pos = int(np.argmin(window["low"].values))
+    raw_start_idx = search_from + rel_min_pos
+
+    # If the lowest low bar itself was a small red bar right before the first green launch bar,
+    # step 1 bar forward if that next bar is bullish and holds above the swing low
+    if (
+        raw_start_idx < peak_idx
+        and float(df["close"].iloc[raw_start_idx]) <= float(df["open"].iloc[raw_start_idx])
+        and float(df["close"].iloc[raw_start_idx + 1]) > float(df["open"].iloc[raw_start_idx + 1])
+    ):
+        return raw_start_idx + 1, min_low_val
+
+    return raw_start_idx, min_low_val
+
+def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
+    """
+    Validates the 3-Phase Kalyan Jewellers structure:
+      Phase 0 (Prior Base): Stock was in a low base / downtrend before `start_idx` (just started rallying).
+      Phase 1 (Impulse Rally): True base-to-peak leg has >= 1 WRB (ATR2 >= 1.5x prev & > ATR100)
+                               and at most 1, 2, or 3 small-body corrective down bars.
+      Phase 2 (Slow Correction): Consumes strictly MORE bars than the full rally (corr_bars > rally_bars),
+                                 stays above the rally base, and has smaller corrective bodies.
+    """
+    start_info = find_true_rally_start_idx(df, peak_idx)
+    if not start_info:
+        return None
+
+    start_idx, swing_low_price = start_info
     rally_bars = peak_idx - start_idx + 1
     corr_bars = end_corr_idx - peak_idx
 
@@ -347,33 +398,63 @@ def check_rally_and_correction_window(df, start_idx, peak_idx, end_corr_idx):
     rally_slice = df.iloc[start_idx : peak_idx + 1]
     corr_slice = df.iloc[peak_idx + 1 : end_corr_idx + 1]
 
-    # Starting bar of the rally must be a bullish bar and the lowest point of the rally
-    first_bar = rally_slice.iloc[0]
-    if float(first_bar["close"]) <= float(first_bar["open"]):
-        return None
-
-    rally_start_low = float(first_bar["low"])
-    if float(rally_slice["low"].min()) < rally_start_low:
-        return None
-
-    # Peak bar must be the highest point of the rally
+    # Peak bar must be the highest high of the rally and correction
     rally_peak_high = float(rally_slice.iloc[-1]["high"])
     if float(rally_slice["high"].max()) > rally_peak_high:
         return None
+    if float(corr_slice["high"].max()) > rally_peak_high:
+        return None
 
+    rally_start_low = min(swing_low_price, float(rally_slice["low"].min()))
     rally_range = rally_peak_high - rally_start_low
     ref_atr100 = float(df["atr100"].iloc[end_corr_idx] or 0.0)
+
     if ref_atr100 <= 0 or rally_range < (MIN_RALLY_RANGE_ATR100 * ref_atr100):
         return None
 
-    # Rule 1: At least 1 Bullish Wide-Range Bar (ATR(2) >= 1.5x Prev ATR(2)) inside the rally
+    # --------------------------------------------------------------------------
+    # PHASE 0: "JUST STARTED RALLYING" (MUST LAUNCH FROM A PRIOR BASE / LOW)
+    # --------------------------------------------------------------------------
+    prior_start = max(0, start_idx - PRIOR_BASE_LOOKBACK)
+    prior_slice = df.iloc[prior_start:start_idx]
+    if len(prior_slice) < 10:
+        return None
+
+    prior_high = float(prior_slice["high"].max())
+    prior_low = float(prior_slice["low"].min())
+    total_context_high = max(prior_high, rally_peak_high)
+    total_context_low = min(prior_low, rally_start_low)
+
+    # 1. Rally Peak must be a fresh breakout high above the prior base
+    if prior_high >= rally_peak_high:
+        return None
+
+    # 2. Prior 15 bars before the rally must have been trading in the base (below 65% of the rally peak)
+    recent_prior = df.iloc[max(0, start_idx - 15) : start_idx]
+    if float(recent_prior["high"].max()) > (rally_start_low + PRIOR_HIGH_CEILING_RATIO * rally_range):
+        return None
+
+    # 3. Rally Start Low must be near the bottom of the prior 20-bar range (bottom 45%)
+    if (total_context_high - total_context_low) > 0:
+        start_pos = (rally_start_low - total_context_low) / (total_context_high - total_context_low)
+        if start_pos > MAX_START_POS_IN_PRIOR_BASE:
+            return None
+
+    # --------------------------------------------------------------------------
+    # PHASE 1: IMPULSE RALLY WITH WRB (ATR2 >= 1.5x PREV) & <= 3 SMALL DOWN BARS
+    # --------------------------------------------------------------------------
     wrb_bars = rally_slice[rally_slice["is_bull_wrb"]]
     if len(wrb_bars) < MIN_WRB_COUNT_IN_RALLY:
         return None
 
-    max_wrb_atr_ratio = round(float(wrb_bars["atr2_ratio"].max()), 2)
+    # First WRB must occur in the first half of the rally (the initial launch thrust)
+    first_wrb_pos = int(np.where(rally_slice["is_bull_wrb"].values)[0][0])
+    if first_wrb_pos > max(2, rally_bars // 2):
+        return None
 
-    # Rule 2: 0, 1, 2, or max 3 Small-Body Corrective Down Bars within the rally
+    max_wrb_atr_ratio = round(float(wrb_bars["atr2_ratio"].max()), 2)
+    max_wrb_vs_100 = round(float(wrb_bars["atr2_vs_100"].max()), 2)
+
     down_mask = rally_slice["close"] < rally_slice["open"]
     down_bars = rally_slice[down_mask]
     up_bars = rally_slice[~down_mask]
@@ -386,22 +467,36 @@ def check_rally_and_correction_window(df, start_idx, peak_idx, end_corr_idx):
         for _, d_row in down_bars.iterrows():
             d_body = float(d_row["body"])
             d_atr100 = float(d_row["atr100"] or ref_atr100)
-            if d_body > (SMALL_DOWN_BODY_ATR100_MAX * d_atr100) or d_body > (SMALL_DOWN_BODY_VS_UP_MAX * max_up_body):
+            if (
+                d_body > (SMALL_DOWN_BODY_ATR100_MAX * d_atr100)
+                or d_body > (SMALL_DOWN_BODY_VS_UP_MAX * max_up_body)
+            ):
                 return None
 
-    # Rule 3: Correction stays strictly above Rally Start Low & has not broken above Rally Peak
+    # --------------------------------------------------------------------------
+    # PHASE 2: SLOW TIME-CORRECTION ABOVE RALLY BASE
+    # --------------------------------------------------------------------------
     corr_low = float(corr_slice["low"].min())
-    corr_high = float(corr_slice["high"].max())
-    corr_max_close = float(corr_slice["close"].max())
+    cur_close = float(corr_slice["close"].iloc[-1])
 
+    # Must hold strictly above the starting point of the rally
     if corr_low <= rally_start_low:
         return None
 
-    if corr_max_close > rally_peak_high or corr_high > (rally_peak_high + 0.05 * rally_range):
+    # Retracement depth check (20% to 78% of the rally height)
+    retracement_pct = round(((rally_peak_high - corr_low) / rally_range) * 100.0, 1)
+    if retracement_pct < (MIN_RETRACEMENT_OF_RALLY * 100.0) or retracement_pct > (MAX_RETRACEMENT_OF_RALLY * 100.0):
         return None
 
-    retracement_pct = round(((rally_peak_high - corr_low) / rally_range) * 100.0, 1)
-    if retracement_pct < 10.0 or retracement_pct > (MAX_RETRACEMENT_OF_RALLY * 100.0):
+    # Current close must still be inside the corrective zone (at least 10% below peak high)
+    cur_pullback_pct = ((rally_peak_high - cur_close) / rally_range) * 100.0
+    if cur_pullback_pct < 10.0 or cur_close <= rally_start_low:
+        return None
+
+    # Correction candles must have smaller average body than the rally candles
+    avg_rally_body = float(rally_slice["body"].mean())
+    avg_corr_body = float(corr_slice["body"].mean())
+    if avg_rally_body <= 0 or (avg_corr_body / avg_rally_body) > MAX_CORR_AVG_BODY_VS_RALLY:
         return None
 
     time_ratio = round(float(corr_bars) / float(rally_bars), 2)
@@ -413,6 +508,7 @@ def check_rally_and_correction_window(df, start_idx, peak_idx, end_corr_idx):
         "wrb_count": int(len(wrb_bars)),
         "down_bars_in_rally": int(len(down_bars)),
         "max_wrb_atr2_ratio": max_wrb_atr_ratio,
+        "max_wrb_vs_100": max_wrb_vs_100,
         "rally_start_low": round(rally_start_low, 2),
         "rally_peak_high": round(rally_peak_high, 2),
         "corr_low": round(corr_low, 2),
@@ -421,7 +517,7 @@ def check_rally_and_correction_window(df, start_idx, peak_idx, end_corr_idx):
     }
 
 def evaluate_129m_rally_slow_correction(df_129m):
-    if len(df_129m) < 35:
+    if len(df_129m) < 55:
         return None
 
     df = compute_indicators_129m(df_129m)
@@ -429,22 +525,14 @@ def evaluate_129m_rally_slow_correction(df_129m):
     cur_bar = df.iloc[cur_idx]
 
     best_match = None
-    min_peak_idx = max(10, cur_idx - MAX_CORRECTION_BARS)
+    min_peak_idx = max(PRIOR_BASE_LOOKBACK + MIN_RALLY_BARS, cur_idx - MAX_CORRECTION_BARS)
 
-    for peak_idx in range(cur_idx - 2, min_peak_idx - 1, -1):
-        min_start_idx = max(2, peak_idx - MAX_RALLY_BARS + 1)
-        # Anchor to the earliest valid start_idx (full rally base) for each candidate peak_idx
-        full_rally_for_peak = None
-        for start_idx in range(min_start_idx, peak_idx + 1):
-            res = check_rally_and_correction_window(df, start_idx, peak_idx, cur_idx)
-            if res:
-                full_rally_for_peak = res
-                break
-
-        if full_rally_for_peak:
-            score = (full_rally_for_peak["time_ratio"], full_rally_for_peak["max_wrb_atr2_ratio"])
+    for peak_idx in range(cur_idx - 3, min_peak_idx - 1, -1):
+        res = validate_fresh_rally_and_slow_correction(df, peak_idx, cur_idx)
+        if res:
+            score = (res["time_ratio"], res["max_wrb_atr2_ratio"])
             if best_match is None or score > (best_match["time_ratio"], best_match["max_wrb_atr2_ratio"]):
-                best_match = full_rally_for_peak
+                best_match = res
 
     if best_match is None:
         return None
@@ -463,9 +551,8 @@ def evaluate_129m_rally_slow_correction(df_129m):
 # ==============================================================================
 def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-    subject = f"🔥 129m WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+    subject = f"🔥 129m Fresh WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
-    # Sort with MAX Time Ratio (Correction Time / Rally Time) at the top
     ordered = sorted(
         triggered_list,
         key=lambda x: (x["time_ratio"], x["max_wrb_atr2_ratio"]),
@@ -480,7 +567,7 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
         "Time Ratio (Corr/Rally)",
         "Corr Bars",
         "Rally Bars (WRB | Red)",
-        "Max Rally ATR(2) Ratio",
+        "Rally ATR(2) Thrust (vsPrev | vs100)",
         "Close",
         "Rally Base -> Peak",
         "Corr Low (Retr %)",
@@ -493,7 +580,7 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
             f"{m['time_ratio']:.2f}x",
             f"{m['corr_bars']} bars",
             f"{m['rally_bars']}b ({m['wrb_count']} WRB | {m['down_bars_in_rally']} Red)",
-            f"{m['max_wrb_atr2_ratio']:.2f}x",
+            f"{m['max_wrb_atr2_ratio']:.2f}x | {m['max_wrb_vs_100']:.2f}x",
             f"{m['close']:.2f}",
             f"{m['rally_start_low']:.1f} -> {m['rally_peak_high']:.1f} (+{m['rally_gain_pct']:.1f}%)",
             f"{m['corr_low']:.1f} ({m['retracement_pct']:.0f}%)",
@@ -527,7 +614,7 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 129m WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 129m Fresh WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>129m Bar:</strong> {bar_label} &nbsp;|&nbsp;
                     <strong>Universe Scanned:</strong> {total_scanned} Stocks &nbsp;|&nbsp;
@@ -630,7 +717,8 @@ def run_129m_scanner(force_scan=False):
     for m in triggered:
         print(
             f"  🔥 MATCH: {m['symbol']} | Time Ratio [Corr/Rally]: {m['time_ratio']:.2f}x "
-            f"({m['corr_bars']}b / {m['rally_bars']}b) | WRB: {m['wrb_count']} (Max ATR2: {m['max_wrb_atr2_ratio']}x) | "
+            f"({m['corr_bars']}b / {m['rally_bars']}b) | WRB: {m['wrb_count']} "
+            f"(ATR2 Thrust: {m['max_wrb_atr2_ratio']}x prev, {m['max_wrb_vs_100']}x ATR100) | "
             f"Red in Rally: {m['down_bars_in_rally']} | Retr: {m['retracement_pct']}% | StochK: {m['stoch_k']}"
         )
 
@@ -642,7 +730,7 @@ def run_129m_scanner(force_scan=False):
     if triggered:
         send_129m_pattern_email(triggered, bar_label_used, len(token_map))
     else:
-        print(f"ℹ️ No 129m WRB Rally + Slow Correction setups matched on bar [{bar_label_used}].")
+        print(f"ℹ️ No 129m Fresh WRB Rally + Slow Correction setups matched on bar [{bar_label_used}].")
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -654,7 +742,7 @@ def heartbeat_sleep(target_dt):
 
 def stay_awake_129m_clock():
     now_ist = datetime.now(IST)
-    print(f"🕒 Starting 129m WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"🕒 Starting 129m Fresh WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     is_weekday = now_ist.weekday() < 5
     in_market_window = is_weekday and (dtime(9, 10) <= now_ist.time() <= dtime(15, 35))
