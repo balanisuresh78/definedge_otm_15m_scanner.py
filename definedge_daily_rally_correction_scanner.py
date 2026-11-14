@@ -6,6 +6,8 @@ import zipfile
 import smtplib
 import pyotp
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pytz
 import numpy as np
 import pandas as pd
@@ -48,68 +50,105 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "rally_corr_daily_memory.json"
 
 # ==============================================================================
-# DAILY (1D) "JUST STARTED RALLYING + SLOW TIME-CORRECTION" PARAMETERS
+# DAILY (1D) NIFTY 500 "WRB RALLY + SLOW TIME-CORRECTION" PARAMETERS
 # ==============================================================================
-DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash) or "NFO" (Near-Month Futures)
+DATA_SEGMENT = "NSE"                  # Scans Continuous NSE Cash Spot across Nifty 500
 ATR_FAST_PERIOD = 2                   # ATR(2) for Wide-Range Bar thrust check
-ATR_SLOW_PERIOD = 100                 # ATR(100) baseline for WRB & small-body checks
+ATR_SLOW_PERIOD = 100                 # ATR(100) baseline
 ATR_METHOD = "SMA"                    # "SMA" or "RMA"
 
-# Phase 0: "Just Started Rallying" (Prior Base / Low Context)
-PRIOR_BASE_LOOKBACK = 20              # Trading days prior to rally start used to verify base/low launch
-MAX_START_POS_IN_PRIOR_BASE = 0.45    # Rally Start Low must be in the bottom 45% of the prior 20-day range
-PRIOR_HIGH_CEILING_RATIO = 0.65       # Prior 15 days before rally must not have exceeded 65% of new rally height
+# Phase 0: "Just Started Rallying" (Launched from a Prior Base / Low)
+PRIOR_BASE_LOOKBACK = 20              # 20 trading days prior to rally start
+MAX_START_POS_IN_PRIOR_RANGE = 0.65   # Rally Start Low must sit in the lower 65% of the prior 20-day range
 
-# Phase 1: Impulse Rally Rules (True Full-Leg Base-to-Peak)
-WRB_ATR2_PREV_MULT = 1.5              # Rally WRB must have ATR(2) >= 1.5x Previous Day's ATR(2)
-WRB_ATR2_VS_ATR100_MIN = 1.35         # Rally WRB must have ATR(2) >= 1.35x ATR(100) (spikes above ATR 100 line)
-WRB_BODY_VS_ATR100_MIN = 1.0          # Rally WRB bullish body |Close - Open| >= 1.0x ATR(100)
-MIN_WRB_COUNT_IN_RALLY = 1            # At least 1 wide-range bullish thrust day in the rally
-MAX_DOWN_BARS_IN_RALLY = 3            # Allow 0, 1, 2, or max 3 small-body corrective down days inside rally
-SMALL_DOWN_BODY_ATR100_MAX = 0.67     # Down day body inside rally must be <= 0.67 * ATR(100)
-SMALL_DOWN_BODY_VS_UP_MAX = 0.45      # Down day body inside rally must be <= 45% of max bullish rally body
-MIN_RALLY_BARS = 2                    # Minimum days in the full impulse rally leg (set to 1 to allow 1-day thrusts)
-MAX_RALLY_BARS = 10                   # Maximum days in the full impulse rally leg
-MIN_RALLY_RANGE_ATR100 = 2.8          # Total rally height (Peak High - Start Low) >= 2.8x ATR(100)
+# Phase 1: Impulse Rally Rules (Anchored at First Bullish WRB)
+WRB_ATR2_PREV_MULT = 1.5              # WRB Rule: ATR(2) >= 1.5x Previous Bar's ATR(2)
+WRB_ATR2_VS_ATR100_MIN = 1.05         # WRB Rule: ATR(2) > ATR(100) (blue ATR 2 line above black ATR 100 line)
+WRB_BODY_VS_ATR100_MIN = 0.75         # WRB Rule: Bullish body |Close - Open| >= 0.75x ATR(100)
+MIN_WRB_COUNT_IN_RALLY = 1            # At least 1 wide-range bullish bar in the rally
+MAX_DOWN_BARS_IN_RALLY = 3            # Allow 0, 1, 2, or max 3 small-body corrective down bars inside rally
+SMALL_DOWN_BODY_ATR100_MAX = 0.80     # Down bar body inside rally <= 0.80 * ATR(100)
+SMALL_DOWN_BODY_VS_UP_MAX = 0.50      # Down bar body inside rally <= 50% of max bullish body in the rally
+MIN_RALLY_BARS = 1                    # 1 to 10 bars in the impulse rally leg
+MAX_RALLY_BARS = 10                   # Max bars in the impulse rally leg
+MIN_RALLY_RANGE_ATR100 = 1.8          # Total rally height (Peak High - Start Low) >= 1.8x ATR(100)
 
-# Phase 2: Slow Time-Correction Rules (Correction Days > Rally Days)
-MAX_CORRECTION_BARS = 35              # Max trading days to look back for the rally peak
-MIN_RETRACEMENT_OF_RALLY = 0.20       # Must pull back at least 20% from peak (actual correction, not flat top)
-MAX_RETRACEMENT_OF_RALLY = 0.78       # Correction Low must hold well above Rally Start Low (<= 78% retracement)
-MAX_CORR_AVG_BODY_VS_RALLY = 0.65     # Avg body in correction must be < 65% of avg body in rally (slow pullback)
+# Phase 2: Slow Time-Correction Rules (Correction Time > Rally Time)
+MAX_CORRECTION_BARS = 40              # Max trading days to look back for the rally peak
+MIN_RETRACEMENT_OF_RALLY = 0.15       # Pullback low retraces at least 15% from peak high
+MAX_RETRACEMENT_OF_RALLY = 0.88       # Pullback low stays strictly above Rally Start Low (<= 88% retracement)
 
-# Lookback (300 calendar days = ~200 trading days for accurate 100-day ATR + 100-day pattern window)
+# Lookback (300 calendar days = ~200 trading days for accurate ATR(100))
 LOOKBACK_DAYS_DAILY = 300
 
-# Daily Market Close Checkpoint (3:30:15 PM IST)
 SCAN_CHECKPOINTS_IST = [
     dtime(15, 30, 15)
 ]
 
 # ==============================================================================
-# HIGH-BETA NSE F&O UNIVERSE (102 STOCKS INCLUDING KALYANJWL & PAYTM)
+# BUILT-IN NIFTY 500 CONSTITUENT LIST (PLUS LIVE NSE ARCHIVE AUTO-UPDATE)
 # ==============================================================================
-high_beta_stocks = [
-    "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
-    "FEDERALBNK", "HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDUSINDBK", "KOTAKBANK",
-    "PNB", "RBLBANK", "SBIN", "SHRIRAMFIN", "AUBANK", "BANDHANBNK",
-    "ABCAPITAL", "LICHSGFIN", "LTF", "MANAPPURAM",
-    "ANGELONE", "BSE", "CDSL", "MCX", "CAMS", "HDFCAMC", "JIOFIN", "MUTHOOTFIN", "PAYTM",
-    "BDL", "BEL", "BHEL", "HAL", "IRFC", "MAZDOCK", "PFC", "RECLTD",
-    "TATAPOWER", "JSWENERGY", "NTPC", "POWERGRID", "COALINDIA", "ONGC",
-    "BPCL", "HINDPETRO", "IOC", "GAIL", "IREDA", "RVNL",
-    "ABB", "CGPOWER", "CUMMINSIND", "DIXON", "KAYNES", "POLYCAB", "SIEMENS",
-    "HAVELLS", "VOLTAS", "BHARATFORG", "ASTRAL",
-    "ADANIENT", "ADANIPORTS", "ADANIGREEN", "ADANIENSOL", "HINDALCO",
-    "JINDALSTEL", "JSWSTEEL", "TATASTEEL", "VEDL", "NMDC", "NATIONALUM",
-    "BAJAJ-AUTO", "M&M", "MARUTI", "MOTHERSON", "TMPV", "TVSMOTOR",
-    "EICHERMOT", "ASHOKLEY", "TRENT", "ETERNAL", "NYKAA", "KALYANJWL",
-    "BHARTIARTL", "INDIGO", "INDUSTOWER",
-    "COFORGE", "PERSISTENT", "OFSS", "INFY", "TCS", "HCLTECH", "TECHM", "KPITTECH",
-    "DLF", "GODREJPROP", "OBEROIRLTY", "LT", "DIVISLAB", "LAURUSLABS"
+FALLBACK_NIFTY_500_STOCKS = [
+    "360ONE", "3MINDIA", "ABB", "ACC", "AIAENG", "APLAPOLLO", "AUBANK", "AARTIIND", "AAVAS", "ABBOTINDIA",
+    "ACE", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ATGL", "AWL", "ABCAPITAL", "ABFRL",
+    "AEGISLOG", "AETHER", "AFFLE", "AJANTPHARM", "APLLTD", "ALKEM", "ALKYLAMINE", "ALLCARGO", "ALOKINDS", "ARE&M",
+    "AMBER", "AMBUJACEM", "ANANDRATHI", "ANGELONE", "ANURAS", "APARINDS", "APOLLOHOSP", "APOLLOTYRE", "APTUS", "ACI",
+    "ASAHIINDIA", "ASHOKLEY", "ASIANPAINT", "ASTERDM", "ASTRAL", "ATUL", "AUROPHARMA", "AVANTIFEED", "DMART", "AXISBANK",
+    "BEML", "BLS", "BSE", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BAJAJHLDNG", "BALAMINES", "BALKRISIND", "BALRAMCHIN",
+    "BANDHANBNK", "BANKBARODA", "BANKINDIA", "MAHABANK", "BATAINDIA", "BAYERCROP", "BERGEPAINT", "BDL", "BEL", "BHARATFORG",
+    "BHEL", "BPCL", "BHARTIARTL", "BIKAJI", "BIOCON", "BIRLACORPN", "BSOFT", "BLUEDART", "BLUESTARCO", "BBTC",
+    "BORORENEW", "BOSCHLTD", "BRIGADE", "BRITANNIA", "MAPMYINDIA", "CCL", "CESC", "CGPOWER", "CIEINDIA", "CRISIL",
+    "CSBBANK", "CAMPUS", "CANFINHOME", "CANBK", "CAPLIPOINT", "CGCL", "CARBORUNIV", "CASTROLIND", "CEATLTD", "CELLO",
+    "CENTRALBK", "CDSL", "CENTURYPLY", "CENTURYTEX", "CERA", "CHALET", "CHAMBLFERT", "CHEMPLASTS", "CHENNPETRO", "CHOLAHLDNG",
+    "CHOLAFIN", "CIPLA", "CUB", "CLEAN", "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL", "CAMS", "CONCORDBIO",
+    "CONCOR", "COROMANDEL", "CRAFTSMAN", "CREDITACC", "CROMPTON", "CUMMINSIND", "CYIENT", "DCMSHRIRAM", "DLF", "DOMS",
+    "DABUR", "DALBHARAT", "DATAPATTNS", "DEEPAKFERT", "DEEPAKNTR", "DELHIVERY", "DEVYANI", "DIVISLAB", "DIXON", "LALPATHLAB",
+    "DRREDDY", "EIDPARRY", "EIHOTEL", "EPL", "EASEMYTRIP", "EICHERMOT", "ELECON", "ELGIEQUIP", "EMAMILTD", "ENDURANCE",
+    "ENGINERSIN", "EQUITASBNK", "ERIS", "ESCORTS", "ETERNAL", "EXIDEIND", "FDC", "NYKAA", "FEDERALBNK", "FACT",
+    "FINEORG", "FINCABLES", "FINPIPE", "FSL", "FIVESTAR", "FORTIS", "GAIL", "GMMPFAUDLR", "GMRINFRA", "GRSE",
+    "GICRE", "GILLETTE", "GLAND", "GLAXO", "GLENMARK", "MEDANTA", "GODIGIT", "GPIL", "GODFRYPHLP", "GODREJCP",
+    "GODREJIND", "GODREJPROP", "GRANULES", "GRAPHITE", "GRASIM", "GESHIP", "GRINDWELL", "GAEL", "FLUOROCHEM", "GUJGASLTD",
+    "GMDCLTD", "GNFC", "GPPL", "GSFC", "GSPL", "HEG", "HBLPOWER", "HCLTECH", "HDFCAMC", "HDFCBANK",
+    "HDFCLIFE", "HFCL", "HAPPSTMNDS", "HAPPYFORGE", "HAVELLS", "HEROMOTOCO", "HSCL", "HINDALCO", "HAL", "HINDCOPPER",
+    "HINDPETRO", "HINDUNILVR", "HINDZINC", "POWERINDIA", "HOMEFIRST", "HONASA", "HONAUT", "HUDCO", "ICICIBANK", "ICICIGI",
+    "ICICIPRULI", "ISEC", "IDBI", "IDFCFIRSTB", "IFCI", "IIFL", "IRB", "IRCON", "ITC", "ITI",
+    "INDIACEM", "IBULHSGFIN", "INDIAMART", "INDIANB", "IEX", "INDHOTEL", "IOC", "IOB", "IRCTC", "IRFC",
+    "IREDA", "IGL", "INDUSTOWER", "INDUSINDBK", "NAUKRI", "INFY", "INOXWIND", "INTELLECT", "INDIGO", "IPCALAB",
+    "JBCHEPHARM", "JKCEMENT", "JBMA", "JKLAKSHMI", "JKPAPER", "JMFINANCIL", "JSWENERGY", "JSWINFRA", "JSWSTEEL", "JAIBALAJI",
+    "JAMNAAUTO", "JINDALSAW", "JSL", "JINDALSTEL", "JIOFIN", "JUBLFOOD", "JUBLINGREA", "JUBLPHARMA", "JWL", "JUSTDIAL",
+    "JYOTHYLAB", "JYOTICNC", "KPRMILL", "KEI", "KNRCON", "KPITTECH", "KRBL", "KSB", "KAJARIACER", "KPIL",
+    "KALYANJWL", "KANSAINER", "KARURVYSYA", "KAYNES", "KEC", "KFINTECH", "KOTAKBANK", "KIMS", "LTF", "LTTS",
+    "LICHSGFIN", "LTIM", "LT", "LATENTVIEW", "LAURUSLABS", "LXCHEM", "LEMONTREE", "LICI", "LINDEINDIA", "LLOYDSME",
+    "LUPIN", "MMTC", "MRF", "MTARTECH", "LODHA", "MGL", "MAHSEAMLES", "M&MFIN", "M&M", "MAHLIFE",
+    "MANAPPURAM", "MRPL", "MANKIND", "MARICO", "MARUTI", "MASTEK", "MFSL", "MAXHEALTH", "MAZDOCK", "MEDPLUS",
+    "METROBRAND", "METROPOLIS", "MINDACORP", "MSUMI", "MOTILALOFS", "MPHASIS", "MCX", "MUTHOOTFIN", "NATCOPHARM", "NBCC",
+    "NCC", "NHPC", "NLCINDIA", "NMDC", "NSLNISP", "NTPC", "NH", "NATIONALUM", "NAVINFLUOR", "NESTLEIND",
+    "NETWORK18", "NEWGEN", "NAM-INDIA", "NUVAMA", "NUVOCO", "OBEROIRLTY", "ONGC", "OIL", "OLECTRA", "PAYTM",
+    "OFSS", "POLICYBZR", "PCBL", "PIIND", "PNBHOUSING", "PNCINFRA", "PVRINOX", "PAGEIND", "PATANJALI", "PERSISTENT",
+    "PETRONET", "PFIZER", "PHOENIXLTD", "PIDILITIND", "PEL", "PPLPHARMA", "POLYMED", "POLYCAB", "POONAWALLA", "PFC",
+    "POWERGRID", "PRAJIND", "PRESTIGE", "PRINCEPIPE", "PRSMJOHNSN", "PGHH", "PNB", "QUESS", "RRKABEL", "RBLBANK",
+    "RECLTD", "RHIM", "RITES", "RADICO", "RVNL", "RAILTEL", "RAINBOW", "RAJESHEXPO", "RKFORGE", "RCF",
+    "RATNAMANI", "RTNINDIA", "RAYMOND", "REDINGTON", "RELIANCE", "RBA", "ROUTE", "SBFC", "SBICARD", "SBILIFE",
+    "SJVN", "SKFINDIA", "SRF", "SAFARI", "SAIL", "SANOFI", "SAPPHIRE", "SAREGAMA", "SCHAEFFLER", "SCHNEIDER",
+    "SHREECEM", "RENUKA", "SHRIRAMFIN", "SHYAMMETL", "SIEMENS", "SIGNATURE", "SOBHA", "SOLARINDS", "SONACOMS", "SONATSOFTW",
+    "STARHEALTH", "SBIN", "SAIL", "SWSOLAR", "STLTECH", "SUMICHEM", "SPARC", "SUNPHARMA", "SUNTV", "SUNDARMFIN",
+    "SUNDRMFAST", "SUPREMEIND", "SUVENPHAR", "SUZLON", "SWANENERGY", "SYNGENE", "SYRMA", "TBOTEK", "TVSMOTOR", "TVSSCS",
+    "TANLA", "TATACHEM", "TATACOMM", "TCS", "TATACONSUM", "TATAELXSI", "TATAINVEST", "TMPV", "TATAMOTORS", "TATAPOWER",
+    "TATASTEEL", "TATATECH", "TTML", "TECHM", "TEJASNET", "NIACL", "RAMCOCEM", "THERMAX", "TIMKEN", "TITAGARH",
+    "TITAN", "TORNTPHARM", "TORNTPOWER", "TRENT", "TRIDENT", "TRIVENI", "TRITURBINE", "TIINDIA", "UCOBANK", "UNOMINDA",
+    "UPL", "UTIAMC", "UJJIVANSFB", "ULTRACEMCO", "UNIONBANK", "UBL", "UNITDSPR", "USHAMART", "VGUARD", "VIPIND",
+    "VAIBHAVGBL", "VTL", "VARROC", "VBL", "MANYAVAR", "VEDL", "VIJAYA", "VINATIORGA", "IDEA", "VOLTAS",
+    "WELCORP", "WELSPUNLIV", "WESTLIFE", "WHIRLPOOL", "WIPRO", "YESBANK", "ZEEL", "ZENSARTECH", "ZOMATO", "ZYDUSLIFE",
+    "ECLERX"
 ]
 
 SESSION_CACHE = {"key": "", "date": ""}
+
+# Shared HTTP Session with connection pooling for fast 500-stock scanning
+HTTP_SESSION = requests.Session()
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=2, backoff_factor=0.3))
+HTTP_SESSION.mount("https://", adapter)
+HTTP_SESSION.mount("http://", adapter)
 
 # ==============================================================================
 # 2. JSON MEMORY PERSISTENCE
@@ -132,7 +171,7 @@ def save_memory(mem):
         print(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTHENTICATION & OFFICIAL DAILY DATA ENGINE (LEADING-0 SAFE)
+# 3. DEFINEDGE AUTH, NIFTY 500 UNIVERSE LOADER & DAILY DATA ENGINE
 # ==============================================================================
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -142,13 +181,13 @@ def get_definedge_session_key(force_refresh=False):
     for attempt in range(1, 4):
         try:
             url_step1 = f"https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/login/{DEFINEDGE_API_TOKEN}"
-            r1 = requests.get(url_step1, headers={"api_secret": DEFINEDGE_API_SECRET}, timeout=15)
+            r1 = HTTP_SESSION.get(url_step1, headers={"api_secret": DEFINEDGE_API_SECRET}, timeout=15)
             r1.raise_for_status()
             otp_token = r1.json().get("otp_token")
 
             totp_code = pyotp.TOTP(DEFINEDGE_TOTP_SECRET).now()
             url_step2 = "https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/token"
-            r2 = requests.post(url_step2, json={"otp_token": otp_token, "otp": totp_code}, timeout=15)
+            r2 = HTTP_SESSION.post(url_step2, json={"otp_token": otp_token, "otp": totp_code}, timeout=15)
             r2.raise_for_status()
             session_key = r2.json().get("api_session_key")
 
@@ -162,12 +201,34 @@ def get_definedge_session_key(force_refresh=False):
             time.sleep(4)
     raise RuntimeError("Could not authenticate with Definedge API.")
 
-def load_definedge_tokens():
-    today = datetime.now(IST).date()
-    stock_set = set(high_beta_stocks)
+def get_nifty_500_symbol_set():
+    """Fetches official Nifty 500 list from NSE Archives and merges with built-in 500 list."""
+    symbols = set(FALLBACK_NIFTY_500_STOCKS)
+    urls = [
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for u in urls:
+        try:
+            r = HTTP_SESSION.get(u, headers=headers, timeout=10)
+            if r.status_code == 200 and "Symbol" in r.text:
+                df_n500 = pd.read_csv(io.StringIO(r.text))
+                if "Symbol" in df_n500.columns:
+                    live_syms = set(df_n500["Symbol"].dropna().astype(str).str.strip().tolist())
+                    if len(live_syms) >= 400:
+                        symbols.update(live_syms)
+                        print(f"📥 Loaded live Nifty 500 constituent list ({len(live_syms)} symbols).")
+                        break
+        except Exception:
+            pass
+    return symbols
+
+def load_definedge_nifty500_tokens():
+    nifty500_set = get_nifty_500_symbol_set()
 
     url = "https://app.definedgesecurities.com/public/allmaster.zip"
-    resp = requests.get(url, timeout=30)
+    resp = HTTP_SESSION.get(url, timeout=30)
     resp.raise_for_status()
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
@@ -177,32 +238,12 @@ def load_definedge_tokens():
 
     nse_eq = df[
         (df[0] == "NSE")
-        & (df[2].str.strip().isin(stock_set))
+        & (df[2].str.strip().isin(nifty500_set))
         & (df[4].str.strip() == "EQ")
     ].copy()
     eq_map = {row[2].strip(): row[1].strip() for _, row in nse_eq.iterrows()}
-
-    nfo = df[
-        (df[0] == "NFO")
-        & (df[2].str.strip().isin(stock_set))
-        & (df[4].str.strip() == "FUTSTK")
-    ].copy()
-    nfo[1] = nfo[1].str.strip()
-    nfo[2] = nfo[2].str.strip()
-    nfo[3] = nfo[3].str.strip()
-
-    for exp_col in [5, 8, 6, 7]:
-        if exp_col in nfo.columns:
-            parsed = pd.to_datetime(nfo[exp_col].str.strip().str.zfill(8), format="%d%m%Y", errors="coerce")
-            if parsed.notna().sum() > 0:
-                nfo["expiry"] = parsed.dt.date
-                break
-
-    nfo = nfo[nfo["expiry"].notna() & (nfo["expiry"] >= today)]
-    fut_df = nfo.sort_values("expiry").groupby(2, as_index=False).first()
-    fut_map = {row[2]: row[1] for _, row in fut_df.iterrows()}
-
-    return eq_map, fut_map
+    print(f"✅ Mapped {len(eq_map)} Nifty 500 NSE Cash (EQ) stocks from Definedge Master.")
+    return eq_map
 
 def fetch_definedge_day_df(segment, token, start_dt, end_dt):
     from_str = start_dt.strftime("%d%m%Y%H%M")
@@ -212,7 +253,7 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = requests.get(url, headers={"Authorization": session_key}, timeout=20)
+            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=20)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
@@ -240,7 +281,7 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
         except Exception as e:
             if attempt == 2:
                 print(f"⚠️ Daily fetch error ({segment}/{token}): {e}")
-            time.sleep(2)
+            time.sleep(1.5)
     return pd.DataFrame()
 
 # ==============================================================================
@@ -275,11 +316,11 @@ def compute_indicators_daily(df_day):
     df["stoch_k"] = pd.Series(fast_k, index=df.index).rolling(3, min_periods=3).mean()
     df["stoch_d"] = df["stoch_k"].rolling(3, min_periods=3).mean()
 
-    # True Bullish Wide-Range Bar (WRB) on Daily:
-    # 1. Bullish day (Close > Open and Close > Prev Close)
-    # 2. ATR(2) >= 1.5x Previous Day's ATR(2)
-    # 3. ATR(2) >= 1.35x ATR(100) (blue ATR 2 line spikes above black ATR 100 line)
-    # 4. Bullish candle body >= 1.0x ATR(100)
+    # Bullish Wide-Range Bar (WRB):
+    # 1. Bullish candle (Close > Open and Close > Prev Close)
+    # 2. ATR(2) >= 1.5x Previous Bar's ATR(2)
+    # 3. ATR(2) >= 1.05x ATR(100) (ATR 2 line sits above ATR 100 line)
+    # 4. Bullish Body >= 0.75x ATR(100)
     df["is_bull_wrb"] = (
         (df["close"] > df["open"])
         & (df["close"] > prev_close)
@@ -290,46 +331,18 @@ def compute_indicators_daily(df_day):
     return df
 
 # ==============================================================================
-# 5. PATTERN DETECTOR: FRESH IMPULSE RALLY FROM BASE + SLOWER TIME-CORRECTION
+# 5. PATTERN DETECTOR: WRB-ANCHORED IMPULSE RALLY + SLOWER TIME-CORRECTION
 # ==============================================================================
-def find_true_rally_start_idx(df, peak_idx):
+def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_idx):
     """
-    Finds the true structural starting day of the rally ending at `peak_idx`
-    so the scanner NEVER slices just the top 1-2 days of a longer move.
+    Evaluates [start_idx .. peak_idx] as the Impulse Rally and [peak_idx + 1 .. end_corr_idx]
+    as the Slow Time-Correction:
+      - `start_idx` is anchored directly to the first Bullish WRB (or the single bullish bar
+        immediately before the first WRB) so prior sideways base bars are NEVER mixed in.
+      - Rally has >= 1 Bullish WRB (ATR2 >= 1.5x Prev ATR2) and 0..3 small-body red bars.
+      - Correction consumes strictly MORE days than the rally (corr_bars > rally_bars)
+        and holds strictly above the starting low of the rally.
     """
-    search_from = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
-    if search_from >= peak_idx:
-        return None
-
-    window = df.iloc[search_from : peak_idx + 1]
-    min_low_val = float(window["low"].min())
-
-    rel_min_pos = int(np.argmin(window["low"].values))
-    raw_start_idx = search_from + rel_min_pos
-
-    if (
-        raw_start_idx < peak_idx
-        and float(df["close"].iloc[raw_start_idx]) <= float(df["open"].iloc[raw_start_idx])
-        and float(df["close"].iloc[raw_start_idx + 1]) > float(df["open"].iloc[raw_start_idx + 1])
-    ):
-        return raw_start_idx + 1, min_low_val
-
-    return raw_start_idx, min_low_val
-
-def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
-    """
-    Validates the 3-Phase Kalyan Jewellers structure on Daily Candles:
-      Phase 0 (Prior Base): Stock was in a low base / downtrend before `start_idx` (just started rallying).
-      Phase 1 (Impulse Rally): True base-to-peak leg has >= 1 WRB (ATR2 >= 1.5x prev & > ATR100)
-                               and at most 1, 2, or 3 small-body corrective down days.
-      Phase 2 (Slow Correction): Consumes strictly MORE days than the full rally (corr_bars > rally_bars),
-                                 stays above the rally base, and has smaller corrective bodies.
-    """
-    start_info = find_true_rally_start_idx(df, peak_idx)
-    if not start_info:
-        return None
-
-    start_idx, swing_low_price = start_info
     rally_bars = peak_idx - start_idx + 1
     corr_bars = end_corr_idx - peak_idx
 
@@ -341,58 +354,54 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
     rally_slice = df.iloc[start_idx : peak_idx + 1]
     corr_slice = df.iloc[peak_idx + 1 : end_corr_idx + 1]
 
-    # Peak day must be the highest high of the rally and correction
+    # 1. Rally must start on a Bullish WRB (or a bullish launch bar immediately followed by a WRB)
+    first_bar = rally_slice.iloc[0]
+    if float(first_bar["close"]) <= float(first_bar["open"]):
+        return None
+
+    starts_with_wrb = bool(first_bar["is_bull_wrb"]) or (
+        len(rally_slice) >= 2 and bool(rally_slice.iloc[1]["is_bull_wrb"])
+    )
+    if not starts_with_wrb:
+        return None
+
+    rally_start_low = float(first_bar["low"])
+    if float(rally_slice["low"].min()) < rally_start_low:
+        return None
+
+    # 2. Peak bar must be the highest point of the rally
     rally_peak_high = float(rally_slice.iloc[-1]["high"])
+    rally_peak_close = float(rally_slice.iloc[-1]["close"])
     if float(rally_slice["high"].max()) > rally_peak_high:
         return None
-    if float(corr_slice["high"].max()) > rally_peak_high:
-        return None
 
-    rally_start_low = min(swing_low_price, float(rally_slice["low"].min()))
     rally_range = rally_peak_high - rally_start_low
     ref_atr100 = float(df["atr100"].iloc[end_corr_idx] or 0.0)
-
     if ref_atr100 <= 0 or rally_range < (MIN_RALLY_RANGE_ATR100 * ref_atr100):
         return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 0: "JUST STARTED RALLYING" (MUST LAUNCH FROM A PRIOR BASE / LOW)
-    # --------------------------------------------------------------------------
+    # 3. Phase 0 ("Just Started Rallying"): Must launch from a prior base / low
     prior_start = max(0, start_idx - PRIOR_BASE_LOOKBACK)
     prior_slice = df.iloc[prior_start:start_idx]
     if len(prior_slice) < 10:
         return None
 
-    prior_high = float(prior_slice["high"].max())
-    prior_low = float(prior_slice["low"].min())
-    total_context_high = max(prior_high, rally_peak_high)
-    total_context_low = min(prior_low, rally_start_low)
-
-    # 1. Rally Peak must be a fresh breakout high above the prior base
-    if prior_high >= rally_peak_high:
-        return None
-
-    # 2. Prior 15 days before the rally must have been trading in the base (below 65% of the rally peak)
+    # Rally peak must break out above the prior 15 bars before the rally started
     recent_prior = df.iloc[max(0, start_idx - 15) : start_idx]
-    if float(recent_prior["high"].max()) > (rally_start_low + PRIOR_HIGH_CEILING_RATIO * rally_range):
+    if float(recent_prior["high"].max()) >= rally_peak_high:
         return None
 
-    # 3. Rally Start Low must be near the bottom of the prior 20-day range (bottom 45%)
-    if (total_context_high - total_context_low) > 0:
-        start_pos = (rally_start_low - total_context_low) / (total_context_high - total_context_low)
-        if start_pos > MAX_START_POS_IN_PRIOR_BASE:
+    # Rally Start Low must be in the lower 65% of the prior 20-bar range
+    context_high = max(float(prior_slice["high"].max()), rally_peak_high)
+    context_low = min(float(prior_slice["low"].min()), rally_start_low)
+    if (context_high - context_low) > 0:
+        start_pos = (rally_start_low - context_low) / (context_high - context_low)
+        if start_pos > MAX_START_POS_IN_PRIOR_RANGE:
             return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 1: IMPULSE RALLY WITH WRB (ATR2 >= 1.5x PREV) & <= 3 SMALL DOWN DAYS
-    # --------------------------------------------------------------------------
+    # 4. Phase 1: At least 1 Bullish WRB + Max 3 Small-Body Corrective Down Bars inside Rally
     wrb_bars = rally_slice[rally_slice["is_bull_wrb"]]
     if len(wrb_bars) < MIN_WRB_COUNT_IN_RALLY:
-        return None
-
-    # First WRB must occur in the first half of the rally (the initial launch thrust)
-    first_wrb_pos = int(np.where(rally_slice["is_bull_wrb"].values)[0][0])
-    if first_wrb_pos > max(2, rally_bars // 2):
         return None
 
     max_wrb_atr_ratio = round(float(wrb_bars["atr2_ratio"].max()), 2)
@@ -416,30 +425,26 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
             ):
                 return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 2: SLOW TIME-CORRECTION ABOVE RALLY BASE
-    # --------------------------------------------------------------------------
+    # 5. Phase 2: Slow Time-Correction Above Rally Start Low
     corr_low = float(corr_slice["low"].min())
+    corr_max_close = float(corr_slice["close"].max())
+    corr_high = float(corr_slice["high"].max())
     cur_close = float(corr_slice["close"].iloc[-1])
 
     # Must hold strictly above the starting point of the rally
     if corr_low <= rally_start_low:
         return None
 
-    # Retracement depth check (20% to 78% of the rally height)
+    # Correction must not have already closed above the rally peak high (still correcting/coiling)
+    if corr_max_close > rally_peak_high or corr_high > (rally_peak_high + 0.10 * rally_range):
+        return None
+
     retracement_pct = round(((rally_peak_high - corr_low) / rally_range) * 100.0, 1)
     if retracement_pct < (MIN_RETRACEMENT_OF_RALLY * 100.0) or retracement_pct > (MAX_RETRACEMENT_OF_RALLY * 100.0):
         return None
 
-    # Current close must still be inside the corrective zone (at least 10% below peak high)
-    cur_pullback_pct = ((rally_peak_high - cur_close) / rally_range) * 100.0
-    if cur_pullback_pct < 10.0 or cur_close <= rally_start_low:
-        return None
-
-    # Correction daily candles must have smaller average body than the rally daily candles
-    avg_rally_body = float(rally_slice["body"].mean())
-    avg_corr_body = float(corr_slice["body"].mean())
-    if avg_rally_body <= 0 or (avg_corr_body / avg_rally_body) > MAX_CORR_AVG_BODY_VS_RALLY:
+    # Current price should still be below the rally peak (in correction / flag zone)
+    if cur_close >= rally_peak_high or cur_close <= rally_start_low:
         return None
 
     time_ratio = round(float(corr_bars) / float(rally_bars), 2)
@@ -462,7 +467,7 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
     }
 
 def evaluate_daily_rally_slow_correction(df_day):
-    if len(df_day) < 55:
+    if len(df_day) < 50:
         return None
 
     df = compute_indicators_daily(df_day)
@@ -470,14 +475,22 @@ def evaluate_daily_rally_slow_correction(df_day):
     cur_bar = df.iloc[cur_idx]
 
     best_match = None
-    min_peak_idx = max(PRIOR_BASE_LOOKBACK + MIN_RALLY_BARS, cur_idx - MAX_CORRECTION_BARS)
+    min_peak_idx = max(PRIOR_BASE_LOOKBACK + 2, cur_idx - MAX_CORRECTION_BARS)
 
-    for peak_idx in range(cur_idx - 3, min_peak_idx - 1, -1):
-        res = validate_fresh_rally_and_slow_correction(df, peak_idx, cur_idx)
-        if res:
-            score = (res["time_ratio"], res["max_wrb_atr2_ratio"])
+    for peak_idx in range(cur_idx - 2, min_peak_idx - 1, -1):
+        min_start_idx = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
+        # Anchor to the earliest valid WRB start_idx for this peak (full impulse rally leg)
+        full_rally_for_peak = None
+        for start_idx in range(min_start_idx, peak_idx + 1):
+            res = check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, cur_idx)
+            if res:
+                full_rally_for_peak = res
+                break
+
+        if full_rally_for_peak:
+            score = (full_rally_for_peak["time_ratio"], full_rally_for_peak["max_wrb_atr2_ratio"])
             if best_match is None or score > (best_match["time_ratio"], best_match["max_wrb_atr2_ratio"]):
-                best_match = res
+                best_match = full_rally_for_peak
 
     if best_match is None:
         return None
@@ -496,7 +509,7 @@ def evaluate_daily_rally_slow_correction(df_day):
 # ==============================================================================
 def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-    subject = f"🔥 Daily (1D) Fresh WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+    subject = f"🔥 Nifty 500 Daily (1D) WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
     ordered = sorted(
         triggered_list,
@@ -561,10 +574,10 @@ def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 Daily (1D) Fresh WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 Nifty 500 Daily (1D) WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>Daily Candle:</strong> {bar_label} &nbsp;|&nbsp;
-                    <strong>Universe Scanned:</strong> {total_scanned} Stocks &nbsp;|&nbsp;
+                    <strong>Universe Scanned:</strong> {total_scanned} Nifty 500 Stocks &nbsp;|&nbsp;
                     <strong>Matches:</strong> {len(ordered)}
                 </p>
                 <p style="margin:0 0 4px 0;"><strong>📋 TOP 5 STOCKS (Highest Correction/Rally Time Ratio):</strong></p>
@@ -607,11 +620,11 @@ def run_daily_scanner(force_scan=False):
     memory = load_memory()
 
     get_definedge_session_key()
-    eq_map, fut_map = load_definedge_tokens()
-    token_map = eq_map if DATA_SEGMENT.upper() == "NSE" else fut_map
+    token_map = load_definedge_nifty500_tokens()
+    symbols_list = sorted(token_map.keys())
 
     start_dt = (now_ist - timedelta(days=LOOKBACK_DAYS_DAILY)).replace(hour=9, minute=15, second=0, microsecond=0)
-    print(f"\n🔎 Scanning {len(token_map)} High-Beta Stocks on DAILY (1D) Timeframe...")
+    print(f"\n🔎 Scanning {len(symbols_list)} Nifty 500 Stocks on DAILY (1D) Timeframe...")
 
     def scan_single_stock(symbol):
         token = token_map.get(symbol)
@@ -629,8 +642,8 @@ def run_daily_scanner(force_scan=False):
             print(f"  ⚠️ Error scanning {symbol}: {e}")
         return None
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        results = list(executor.map(scan_single_stock, high_beta_stocks))
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(executor.map(scan_single_stock, symbols_list))
 
     triggered = sorted(
         [r for r in results if r is not None],
@@ -655,9 +668,9 @@ def run_daily_scanner(force_scan=False):
     save_memory(memory)
 
     if triggered:
-        send_daily_pattern_email(triggered, bar_label_used, len(token_map))
+        send_daily_pattern_email(triggered, bar_label_used, len(symbols_list))
     else:
-        print(f"ℹ️ No Daily (1D) Fresh WRB Rally + Slow Correction setups matched on [{bar_label_used}].")
+        print(f"ℹ️ No Daily (1D) WRB Rally + Slow Correction setups matched on [{bar_label_used}].")
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -669,13 +682,13 @@ def heartbeat_sleep(target_dt):
 
 def stay_awake_daily_clock():
     now_ist = datetime.now(IST)
-    print(f"🕒 Starting Daily (1D) Fresh WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"🕒 Starting Nifty 500 Daily (1D) WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     is_weekday = now_ist.weekday() < 5
     in_pre_close_window = is_weekday and (dtime(15, 0) <= now_ist.time() <= dtime(15, 35))
 
     if not in_pre_close_window:
-        print("⚡ Running immediate single-pass Daily (1D) scan...")
+        print("⚡ Running immediate single-pass Nifty 500 Daily (1D) scan...")
         run_daily_scanner(force_scan=True)
         return
 
