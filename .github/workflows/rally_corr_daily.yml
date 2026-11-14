@@ -1,0 +1,63 @@
+name: Daily (1D) WRB Rally + Slow Correction Scanner
+
+on:
+  schedule:
+    # Runs once daily at 03:31 PM IST (10:01 UTC) Mon-Fri right after NSE market close
+    - cron: '1 10 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: rally-corr-daily-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan-daily-rally-correction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore rally_corr_daily_memory.json from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: rally_corr_daily_memory.json
+          key: rally-corr-daily-mem-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            rally-corr-daily-mem-${{ runner.os }}-
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy pyotp pytz tabulate
+
+      - name: Run Daily (1D) WRB Rally + Slow Correction Scanner
+        env:
+          TZ: Asia/Kolkata
+          DEFINEDGE_API_TOKEN: ${{ secrets.DEFINEDGE_API_TOKEN }}
+          DEFINEDGE_API_SECRET: ${{ secrets.DEFINEDGE_API_SECRET }}
+          DEFINEDGE_TOTP_SECRET: ${{ secrets.DEFINEDGE_TOTP_SECRET }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: |
+          python definedge_daily_rally_correction_scanner.py
+
+      - name: Save rally_corr_daily_memory.json to Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: rally_corr_daily_memory.json
+          key: rally-corr-daily-mem-${{ runner.os }}-${{ github.run_id }}
