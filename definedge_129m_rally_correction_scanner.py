@@ -6,6 +6,8 @@ import zipfile
 import smtplib
 import pyotp
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pytz
 import numpy as np
 import pandas as pd
@@ -48,71 +50,49 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "rally_corr_129m_memory.json"
 
 # ==============================================================================
-# 129-MINUTE "JUST STARTED RALLYING + SLOW TIME-CORRECTION" PARAMETERS
+# 129-MINUTE ALL-F&O "WRB RALLY + SLOW TIME-CORRECTION" PARAMETERS
 # ==============================================================================
-DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash) or "NFO" (Near-Month Futures)
+DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash for all F&O stocks) or "NFO" (Futures)
 ATR_FAST_PERIOD = 2                   # ATR(2) for Wide-Range Bar thrust check
-ATR_SLOW_PERIOD = 100                 # ATR(100) baseline for WRB & small-body checks
+ATR_SLOW_PERIOD = 100                 # ATR(100) baseline
 ATR_METHOD = "SMA"                    # "SMA" or "RMA"
 
-# Phase 0: "Just Started Rallying" (Prior Base / Low Context)
-PRIOR_BASE_LOOKBACK = 20              # Bars prior to rally start used to verify stock launched from a base/low
-MAX_START_POS_IN_PRIOR_BASE = 0.45    # Rally Start Low must be in the bottom 45% of the prior 20-bar range
-PRIOR_HIGH_CEILING_RATIO = 0.65       # Prior 15 bars before rally must not have exceeded 65% of the new rally height
+# Phase 0: "Just Started Rallying" (Launched from a Prior Base / Low)
+PRIOR_BASE_LOOKBACK = 20              # 20 bars prior to rally start
+MAX_START_POS_IN_PRIOR_RANGE = 0.65   # Rally Start Low must sit in the lower 65% of the prior 20-bar range
 
-# Phase 1: Impulse Rally Rules (True Full-Leg Base-to-Peak)
-WRB_ATR2_PREV_MULT = 1.5              # Rally WRB must have ATR(2) >= 1.5x Previous Bar's ATR(2)
-WRB_ATR2_VS_ATR100_MIN = 1.35         # Rally WRB must have ATR(2) >= 1.35x ATR(100) (spikes above ATR 100 line)
-WRB_BODY_VS_ATR100_MIN = 1.0          # Rally WRB bullish body |Close - Open| >= 1.0x ATR(100)
-MIN_WRB_COUNT_IN_RALLY = 1            # At least 1 wide-range bullish thrust bar in the rally
+# Phase 1: Impulse Rally Rules (Anchored at First Bullish WRB)
+WRB_ATR2_PREV_MULT = 1.5              # WRB Rule: ATR(2) >= 1.5x Previous Bar's ATR(2)
+WRB_ATR2_VS_ATR100_MIN = 1.05         # WRB Rule: ATR(2) > ATR(100) (blue ATR 2 line above black ATR 100 line)
+WRB_BODY_VS_ATR100_MIN = 0.75         # WRB Rule: Bullish body |Close - Open| >= 0.75x ATR(100)
+MIN_WRB_COUNT_IN_RALLY = 1            # At least 1 wide-range bullish bar in the rally
 MAX_DOWN_BARS_IN_RALLY = 3            # Allow 0, 1, 2, or max 3 small-body corrective down bars inside rally
-SMALL_DOWN_BODY_ATR100_MAX = 0.67     # Down bar body inside rally must be <= 0.67 * ATR(100)
-SMALL_DOWN_BODY_VS_UP_MAX = 0.45      # Down bar body inside rally must be <= 45% of max bullish rally body
-MIN_RALLY_BARS = 2                    # Minimum bars in the full impulse rally leg
-MAX_RALLY_BARS = 10                   # Maximum bars in the full impulse rally leg
-MIN_RALLY_RANGE_ATR100 = 2.8          # Total rally height (Peak High - Start Low) >= 2.8x ATR(100)
+SMALL_DOWN_BODY_ATR100_MAX = 0.80     # Down bar body inside rally <= 0.80 * ATR(100)
+SMALL_DOWN_BODY_VS_UP_MAX = 0.50      # Down bar body inside rally <= 50% of max bullish body in the rally
+MIN_RALLY_BARS = 1                    # 1 to 10 bars in the impulse rally leg
+MAX_RALLY_BARS = 10                   # Max bars in the impulse rally leg
+MIN_RALLY_RANGE_ATR100 = 1.8          # Total rally height (Peak High - Start Low) >= 1.8x ATR(100)
 
 # Phase 2: Slow Time-Correction Rules (Correction Time > Rally Time)
-MAX_CORRECTION_BARS = 35              # Max bars to look back for the rally peak
-MIN_RETRACEMENT_OF_RALLY = 0.20       # Must pull back at least 20% from peak (actual correction, not flat top)
-MAX_RETRACEMENT_OF_RALLY = 0.78       # Correction Low must hold well above Rally Start Low (<= 78% retracement)
-MAX_CORR_AVG_BODY_VS_RALLY = 0.65     # Avg body in correction must be < 65% of avg body in rally (slow pullback)
+MAX_CORRECTION_BARS = 40              # Max 129m bars to look back for the rally peak
+MIN_RETRACEMENT_OF_RALLY = 0.15       # Pullback low retraces at least 15% from peak high
+MAX_RETRACEMENT_OF_RALLY = 0.88       # Pullback low stays strictly above Rally Start Low (<= 88% retracement)
 
 # Lookback (~95 calendar days = ~195 bars of 129m data for accurate ATR(100))
 LOOKBACK_DAYS_1M = 95
 
-# 3 Daily 129m Candle Close Checkpoints:
-# Bar 1: 09:15 - 11:24 | Bar 2: 11:24 - 13:33 | Bar 3: 13:33 - 15:30
 SCAN_CHECKPOINTS_IST = [
     dtime(11, 24, 15),
     dtime(13, 33, 15),
     dtime(15, 30, 15)
 ]
 
-# ==============================================================================
-# HIGH-BETA NSE F&O UNIVERSE (102 STOCKS INCLUDING KALYANJWL & PAYTM)
-# ==============================================================================
-high_beta_stocks = [
-    "AXISBANK", "BAJFINANCE", "BAJAJFINSV", "BANKBARODA", "CANBK", "CHOLAFIN",
-    "FEDERALBNK", "HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDUSINDBK", "KOTAKBANK",
-    "PNB", "RBLBANK", "SBIN", "SHRIRAMFIN", "AUBANK", "BANDHANBNK",
-    "ABCAPITAL", "LICHSGFIN", "LTF", "MANAPPURAM",
-    "ANGELONE", "BSE", "CDSL", "MCX", "CAMS", "HDFCAMC", "JIOFIN", "MUTHOOTFIN", "PAYTM",
-    "BDL", "BEL", "BHEL", "HAL", "IRFC", "MAZDOCK", "PFC", "RECLTD",
-    "TATAPOWER", "JSWENERGY", "NTPC", "POWERGRID", "COALINDIA", "ONGC",
-    "BPCL", "HINDPETRO", "IOC", "GAIL", "IREDA", "RVNL",
-    "ABB", "CGPOWER", "CUMMINSIND", "DIXON", "KAYNES", "POLYCAB", "SIEMENS",
-    "HAVELLS", "VOLTAS", "BHARATFORG", "ASTRAL",
-    "ADANIENT", "ADANIPORTS", "ADANIGREEN", "ADANIENSOL", "HINDALCO",
-    "JINDALSTEL", "JSWSTEEL", "TATASTEEL", "VEDL", "NMDC", "NATIONALUM",
-    "BAJAJ-AUTO", "M&M", "MARUTI", "MOTHERSON", "TMPV", "TVSMOTOR",
-    "EICHERMOT", "ASHOKLEY", "TRENT", "ETERNAL", "NYKAA", "KALYANJWL",
-    "BHARTIARTL", "INDIGO", "INDUSTOWER",
-    "COFORGE", "PERSISTENT", "OFSS", "INFY", "TCS", "HCLTECH", "TECHM", "KPITTECH",
-    "DLF", "GODREJPROP", "OBEROIRLTY", "LT", "DIVISLAB", "LAURUSLABS"
-]
-
 SESSION_CACHE = {"key": "", "date": ""}
+
+HTTP_SESSION = requests.Session()
+adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=Retry(total=2, backoff_factor=0.3))
+HTTP_SESSION.mount("https://", adapter)
+HTTP_SESSION.mount("http://", adapter)
 
 # ==============================================================================
 # 2. JSON MEMORY PERSISTENCE
@@ -135,7 +115,7 @@ def save_memory(mem):
         print(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTHENTICATION & 1-MINUTE HISTORICAL ENGINE (LEADING-0 SAFE)
+# 3. DEFINEDGE AUTH, ALL-F&O DYNAMIC LOADER & 1-MINUTE HISTORICAL ENGINE
 # ==============================================================================
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -145,13 +125,13 @@ def get_definedge_session_key(force_refresh=False):
     for attempt in range(1, 4):
         try:
             url_step1 = f"https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/login/{DEFINEDGE_API_TOKEN}"
-            r1 = requests.get(url_step1, headers={"api_secret": DEFINEDGE_API_SECRET}, timeout=15)
+            r1 = HTTP_SESSION.get(url_step1, headers={"api_secret": DEFINEDGE_API_SECRET}, timeout=15)
             r1.raise_for_status()
             otp_token = r1.json().get("otp_token")
 
             totp_code = pyotp.TOTP(DEFINEDGE_TOTP_SECRET).now()
             url_step2 = "https://signin.definedgesecurities.com/auth/realms/debroking/dsbpkc/token"
-            r2 = requests.post(url_step2, json={"otp_token": otp_token, "otp": totp_code}, timeout=15)
+            r2 = HTTP_SESSION.post(url_step2, json={"otp_token": otp_token, "otp": totp_code}, timeout=15)
             r2.raise_for_status()
             session_key = r2.json().get("api_session_key")
 
@@ -165,12 +145,11 @@ def get_definedge_session_key(force_refresh=False):
             time.sleep(4)
     raise RuntimeError("Could not authenticate with Definedge API.")
 
-def load_definedge_tokens():
+def load_definedge_all_fno_tokens():
     today = datetime.now(IST).date()
-    stock_set = set(high_beta_stocks)
 
     url = "https://app.definedgesecurities.com/public/allmaster.zip"
-    resp = requests.get(url, timeout=30)
+    resp = HTTP_SESSION.get(url, timeout=30)
     resp.raise_for_status()
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
@@ -178,33 +157,34 @@ def load_definedge_tokens():
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
+    nfo_fut = df[
+        (df[0] == "NFO")
+        & (df[4].str.strip() == "FUTSTK")
+    ].copy()
+    nfo_fut[1] = nfo_fut[1].str.strip()
+    nfo_fut[2] = nfo_fut[2].str.strip()
+
+    for exp_col in [5, 8, 6, 7]:
+        if exp_col in nfo_fut.columns:
+            parsed = pd.to_datetime(nfo_fut[exp_col].str.strip().str.zfill(8), format="%d%m%Y", errors="coerce")
+            if parsed.notna().sum() > 0:
+                nfo_fut["expiry"] = parsed.dt.date
+                break
+
+    nfo_fut = nfo_fut[nfo_fut["expiry"].notna() & (nfo_fut["expiry"] >= today)]
+    fut_near = nfo_fut.sort_values("expiry").groupby(2, as_index=False).first()
+    fut_map = {row[2]: row[1] for _, row in fut_near.iterrows()}
+
+    all_fno_symbols = set(fut_map.keys())
+
     nse_eq = df[
         (df[0] == "NSE")
-        & (df[2].str.strip().isin(stock_set))
+        & (df[2].str.strip().isin(all_fno_symbols))
         & (df[4].str.strip() == "EQ")
     ].copy()
     eq_map = {row[2].strip(): row[1].strip() for _, row in nse_eq.iterrows()}
 
-    nfo = df[
-        (df[0] == "NFO")
-        & (df[2].str.strip().isin(stock_set))
-        & (df[4].str.strip() == "FUTSTK")
-    ].copy()
-    nfo[1] = nfo[1].str.strip()
-    nfo[2] = nfo[2].str.strip()
-    nfo[3] = nfo[3].str.strip()
-
-    for exp_col in [5, 8, 6, 7]:
-        if exp_col in nfo.columns:
-            parsed = pd.to_datetime(nfo[exp_col].str.strip().str.zfill(8), format="%d%m%Y", errors="coerce")
-            if parsed.notna().sum() > 0:
-                nfo["expiry"] = parsed.dt.date
-                break
-
-    nfo = nfo[nfo["expiry"].notna() & (nfo["expiry"] >= today)]
-    fut_df = nfo.sort_values("expiry").groupby(2, as_index=False).first()
-    fut_map = {row[2]: row[1] for _, row in fut_df.iterrows()}
-
+    print(f"✅ Dynamically loaded {len(eq_map)} active NSE F&O stocks from Definedge Master.")
     return eq_map, fut_map
 
 def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
@@ -215,7 +195,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = requests.get(url, headers={"Authorization": session_key}, timeout=25)
+            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=25)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
@@ -242,7 +222,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
         except Exception as e:
             if attempt == 2:
                 print(f"⚠️ 1m fetch error ({segment}/{token}): {e}")
-            time.sleep(2)
+            time.sleep(1.5)
     return pd.DataFrame()
 
 # ==============================================================================
@@ -251,11 +231,11 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
 def get_bar_close_dt(bar_start_ts):
     t = bar_start_ts.time()
     if t == dtime(9, 15):
-        return bar_start_ts + timedelta(minutes=129)  # Closes at 11:24
+        return bar_start_ts + timedelta(minutes=129)
     elif t == dtime(11, 24):
-        return bar_start_ts + timedelta(minutes=129)  # Closes at 13:33
+        return bar_start_ts + timedelta(minutes=129)
     else:
-        return bar_start_ts.replace(hour=15, minute=30, second=0, microsecond=0)  # Closes at 15:30
+        return bar_start_ts.replace(hour=15, minute=30, second=0, microsecond=0)
 
 def resample_to_129m(df_1m, now_ist):
     if df_1m.empty:
@@ -320,18 +300,12 @@ def compute_indicators_129m(df_129m):
     df["body"] = (df["close"] - df["open"]).abs()
     df["body_vs_100"] = np.where(df["atr100"] > 0, df["body"] / df["atr100"], 0.0)
 
-    # Stochastic (5, 3, 3)
     low_5 = df["low"].rolling(5, min_periods=5).min()
     high_5 = df["high"].rolling(5, min_periods=5).max()
     fast_k = np.where((high_5 - low_5) > 0, ((df["close"] - low_5) / (high_5 - low_5)) * 100.0, 50.0)
     df["stoch_k"] = pd.Series(fast_k, index=df.index).rolling(3, min_periods=3).mean()
     df["stoch_d"] = df["stoch_k"].rolling(3, min_periods=3).mean()
 
-    # True Bullish Wide-Range Bar (WRB):
-    # 1. Bullish bar (Close > Open and Close > Prev Close)
-    # 2. ATR(2) >= 1.5x Previous ATR(2)
-    # 3. ATR(2) >= 1.35x ATR(100) (blue ATR 2 line spikes above black ATR 100 line)
-    # 4. Bullish candle body >= 1.0x ATR(100)
     df["is_bull_wrb"] = (
         (df["close"] > df["open"])
         & (df["close"] > prev_close)
@@ -342,51 +316,9 @@ def compute_indicators_129m(df_129m):
     return df
 
 # ==============================================================================
-# 5. PATTERN DETECTOR: FRESH IMPULSE RALLY FROM BASE + SLOWER TIME-CORRECTION
+# 5. PATTERN DETECTOR: WRB-ANCHORED IMPULSE RALLY + SLOWER TIME-CORRECTION
 # ==============================================================================
-def find_true_rally_start_idx(df, peak_idx):
-    """
-    Finds the true structural starting bar of the rally ending at `peak_idx`
-    so the scanner NEVER slices just the top 1-2 bars of a longer move:
-      - Walks backward up to MAX_RALLY_BARS from `peak_idx` to locate the lowest
-        swing low (`min_low_idx`) and the first bullish launch bar (`start_idx`).
-    """
-    search_from = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
-    if search_from >= peak_idx:
-        return None
-
-    window = df.iloc[search_from : peak_idx + 1]
-    min_low_val = float(window["low"].min())
-
-    # Positional index of the lowest low inside [search_from .. peak_idx]
-    rel_min_pos = int(np.argmin(window["low"].values))
-    raw_start_idx = search_from + rel_min_pos
-
-    # If the lowest low bar itself was a small red bar right before the first green launch bar,
-    # step 1 bar forward if that next bar is bullish and holds above the swing low
-    if (
-        raw_start_idx < peak_idx
-        and float(df["close"].iloc[raw_start_idx]) <= float(df["open"].iloc[raw_start_idx])
-        and float(df["close"].iloc[raw_start_idx + 1]) > float(df["open"].iloc[raw_start_idx + 1])
-    ):
-        return raw_start_idx + 1, min_low_val
-
-    return raw_start_idx, min_low_val
-
-def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
-    """
-    Validates the 3-Phase Kalyan Jewellers structure:
-      Phase 0 (Prior Base): Stock was in a low base / downtrend before `start_idx` (just started rallying).
-      Phase 1 (Impulse Rally): True base-to-peak leg has >= 1 WRB (ATR2 >= 1.5x prev & > ATR100)
-                               and at most 1, 2, or 3 small-body corrective down bars.
-      Phase 2 (Slow Correction): Consumes strictly MORE bars than the full rally (corr_bars > rally_bars),
-                                 stays above the rally base, and has smaller corrective bodies.
-    """
-    start_info = find_true_rally_start_idx(df, peak_idx)
-    if not start_info:
-        return None
-
-    start_idx, swing_low_price = start_info
+def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_idx):
     rally_bars = peak_idx - start_idx + 1
     corr_bars = end_corr_idx - peak_idx
 
@@ -398,58 +330,47 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
     rally_slice = df.iloc[start_idx : peak_idx + 1]
     corr_slice = df.iloc[peak_idx + 1 : end_corr_idx + 1]
 
-    # Peak bar must be the highest high of the rally and correction
+    first_bar = rally_slice.iloc[0]
+    if float(first_bar["close"]) <= float(first_bar["open"]):
+        return None
+
+    starts_with_wrb = bool(first_bar["is_bull_wrb"]) or (
+        len(rally_slice) >= 2 and bool(rally_slice.iloc[1]["is_bull_wrb"])
+    )
+    if not starts_with_wrb:
+        return None
+
+    rally_start_low = float(first_bar["low"])
+    if float(rally_slice["low"].min()) < rally_start_low:
+        return None
+
     rally_peak_high = float(rally_slice.iloc[-1]["high"])
     if float(rally_slice["high"].max()) > rally_peak_high:
         return None
-    if float(corr_slice["high"].max()) > rally_peak_high:
-        return None
 
-    rally_start_low = min(swing_low_price, float(rally_slice["low"].min()))
     rally_range = rally_peak_high - rally_start_low
     ref_atr100 = float(df["atr100"].iloc[end_corr_idx] or 0.0)
-
     if ref_atr100 <= 0 or rally_range < (MIN_RALLY_RANGE_ATR100 * ref_atr100):
         return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 0: "JUST STARTED RALLYING" (MUST LAUNCH FROM A PRIOR BASE / LOW)
-    # --------------------------------------------------------------------------
     prior_start = max(0, start_idx - PRIOR_BASE_LOOKBACK)
     prior_slice = df.iloc[prior_start:start_idx]
     if len(prior_slice) < 10:
         return None
 
-    prior_high = float(prior_slice["high"].max())
-    prior_low = float(prior_slice["low"].min())
-    total_context_high = max(prior_high, rally_peak_high)
-    total_context_low = min(prior_low, rally_start_low)
-
-    # 1. Rally Peak must be a fresh breakout high above the prior base
-    if prior_high >= rally_peak_high:
-        return None
-
-    # 2. Prior 15 bars before the rally must have been trading in the base (below 65% of the rally peak)
     recent_prior = df.iloc[max(0, start_idx - 15) : start_idx]
-    if float(recent_prior["high"].max()) > (rally_start_low + PRIOR_HIGH_CEILING_RATIO * rally_range):
+    if float(recent_prior["high"].max()) >= rally_peak_high:
         return None
 
-    # 3. Rally Start Low must be near the bottom of the prior 20-bar range (bottom 45%)
-    if (total_context_high - total_context_low) > 0:
-        start_pos = (rally_start_low - total_context_low) / (total_context_high - total_context_low)
-        if start_pos > MAX_START_POS_IN_PRIOR_BASE:
+    context_high = max(float(prior_slice["high"].max()), rally_peak_high)
+    context_low = min(float(prior_slice["low"].min()), rally_start_low)
+    if (context_high - context_low) > 0:
+        start_pos = (rally_start_low - context_low) / (context_high - context_low)
+        if start_pos > MAX_START_POS_IN_PRIOR_RANGE:
             return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 1: IMPULSE RALLY WITH WRB (ATR2 >= 1.5x PREV) & <= 3 SMALL DOWN BARS
-    # --------------------------------------------------------------------------
     wrb_bars = rally_slice[rally_slice["is_bull_wrb"]]
     if len(wrb_bars) < MIN_WRB_COUNT_IN_RALLY:
-        return None
-
-    # First WRB must occur in the first half of the rally (the initial launch thrust)
-    first_wrb_pos = int(np.where(rally_slice["is_bull_wrb"].values)[0][0])
-    if first_wrb_pos > max(2, rally_bars // 2):
         return None
 
     max_wrb_atr_ratio = round(float(wrb_bars["atr2_ratio"].max()), 2)
@@ -473,30 +394,22 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
             ):
                 return None
 
-    # --------------------------------------------------------------------------
-    # PHASE 2: SLOW TIME-CORRECTION ABOVE RALLY BASE
-    # --------------------------------------------------------------------------
     corr_low = float(corr_slice["low"].min())
+    corr_max_close = float(corr_slice["close"].max())
+    corr_high = float(corr_slice["high"].max())
     cur_close = float(corr_slice["close"].iloc[-1])
 
-    # Must hold strictly above the starting point of the rally
     if corr_low <= rally_start_low:
         return None
 
-    # Retracement depth check (20% to 78% of the rally height)
+    if corr_max_close > rally_peak_high or corr_high > (rally_peak_high + 0.10 * rally_range):
+        return None
+
     retracement_pct = round(((rally_peak_high - corr_low) / rally_range) * 100.0, 1)
     if retracement_pct < (MIN_RETRACEMENT_OF_RALLY * 100.0) or retracement_pct > (MAX_RETRACEMENT_OF_RALLY * 100.0):
         return None
 
-    # Current close must still be inside the corrective zone (at least 10% below peak high)
-    cur_pullback_pct = ((rally_peak_high - cur_close) / rally_range) * 100.0
-    if cur_pullback_pct < 10.0 or cur_close <= rally_start_low:
-        return None
-
-    # Correction candles must have smaller average body than the rally candles
-    avg_rally_body = float(rally_slice["body"].mean())
-    avg_corr_body = float(corr_slice["body"].mean())
-    if avg_rally_body <= 0 or (avg_corr_body / avg_rally_body) > MAX_CORR_AVG_BODY_VS_RALLY:
+    if cur_close >= rally_peak_high or cur_close <= rally_start_low:
         return None
 
     time_ratio = round(float(corr_bars) / float(rally_bars), 2)
@@ -509,6 +422,8 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
         "down_bars_in_rally": int(len(down_bars)),
         "max_wrb_atr2_ratio": max_wrb_atr_ratio,
         "max_wrb_vs_100": max_wrb_vs_100,
+        "rally_start_date": rally_slice.index[0].strftime("%d-%b %H:%M"),
+        "rally_peak_date": rally_slice.index[-1].strftime("%d-%b %H:%M"),
         "rally_start_low": round(rally_start_low, 2),
         "rally_peak_high": round(rally_peak_high, 2),
         "corr_low": round(corr_low, 2),
@@ -517,7 +432,7 @@ def validate_fresh_rally_and_slow_correction(df, peak_idx, end_corr_idx):
     }
 
 def evaluate_129m_rally_slow_correction(df_129m):
-    if len(df_129m) < 55:
+    if len(df_129m) < 50:
         return None
 
     df = compute_indicators_129m(df_129m)
@@ -525,14 +440,21 @@ def evaluate_129m_rally_slow_correction(df_129m):
     cur_bar = df.iloc[cur_idx]
 
     best_match = None
-    min_peak_idx = max(PRIOR_BASE_LOOKBACK + MIN_RALLY_BARS, cur_idx - MAX_CORRECTION_BARS)
+    min_peak_idx = max(PRIOR_BASE_LOOKBACK + 2, cur_idx - MAX_CORRECTION_BARS)
 
-    for peak_idx in range(cur_idx - 3, min_peak_idx - 1, -1):
-        res = validate_fresh_rally_and_slow_correction(df, peak_idx, cur_idx)
-        if res:
-            score = (res["time_ratio"], res["max_wrb_atr2_ratio"])
+    for peak_idx in range(cur_idx - 2, min_peak_idx - 1, -1):
+        min_start_idx = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
+        full_rally_for_peak = None
+        for start_idx in range(min_start_idx, peak_idx + 1):
+            res = check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, cur_idx)
+            if res:
+                full_rally_for_peak = res
+                break
+
+        if full_rally_for_peak:
+            score = (full_rally_for_peak["time_ratio"], full_rally_for_peak["max_wrb_atr2_ratio"])
             if best_match is None or score > (best_match["time_ratio"], best_match["max_wrb_atr2_ratio"]):
-                best_match = res
+                best_match = full_rally_for_peak
 
     if best_match is None:
         return None
@@ -551,7 +473,7 @@ def evaluate_129m_rally_slow_correction(df_129m):
 # ==============================================================================
 def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-    subject = f"🔥 129m Fresh WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+    subject = f"🔥 All-F&O 129m WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
     ordered = sorted(
         triggered_list,
@@ -563,10 +485,11 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
     all_syms = ", ".join([m["symbol"] for m in ordered]) or "None"
 
     headers = [
-        "Stock",
+        "F&O Stock",
         "Time Ratio (Corr/Rally)",
         "Corr Bars",
         "Rally Bars (WRB | Red)",
+        "Rally Window",
         "Rally ATR(2) Thrust (vsPrev | vs100)",
         "Close",
         "Rally Base -> Peak",
@@ -580,6 +503,7 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
             f"{m['time_ratio']:.2f}x",
             f"{m['corr_bars']} bars",
             f"{m['rally_bars']}b ({m['wrb_count']} WRB | {m['down_bars_in_rally']} Red)",
+            f"{m['rally_start_date']} -> {m['rally_peak_date']}",
             f"{m['max_wrb_atr2_ratio']:.2f}x | {m['max_wrb_vs_100']:.2f}x",
             f"{m['close']:.2f}",
             f"{m['rally_start_low']:.1f} -> {m['rally_peak_high']:.1f} (+{m['rally_gain_pct']:.1f}%)",
@@ -606,7 +530,7 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
             for idx, r in enumerate(table_rows):
                 bg = "#f8fafc" if idx % 2 == 1 else "#ffffff"
                 tds = "".join(
-                    f'<td style="padding:9px 14px;border:1px solid #cbd5e1;white-space:nowrap;font-size:15px;color:#0f172a;text-align:{"right" if i in (1, 2, 4, 5, 8) else "left"};font-weight:{"600" if i in (0, 1) else "400"};">{cell}</td>'
+                    f'<td style="padding:9px 14px;border:1px solid #cbd5e1;white-space:nowrap;font-size:15px;color:#0f172a;text-align:{"right" if i in (1, 2, 5, 6, 9) else "left"};font-weight:{"600" if i in (0, 1) else "400"};">{cell}</td>'
                     for i, cell in enumerate(r)
                 )
                 tr_list.append(f'<tr style="background-color:{bg};">{tds}</tr>')
@@ -614,16 +538,16 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 129m Fresh WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 All-F&amp;O 129m WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>129m Bar:</strong> {bar_label} &nbsp;|&nbsp;
-                    <strong>Universe Scanned:</strong> {total_scanned} Stocks &nbsp;|&nbsp;
+                    <strong>Universe Scanned:</strong> {total_scanned} NSE F&amp;O Stocks &nbsp;|&nbsp;
                     <strong>Matches:</strong> {len(ordered)}
                 </p>
-                <p style="margin:0 0 4px 0;"><strong>📋 TOP 5 STOCKS (Highest Correction/Rally Time Ratio):</strong></p>
+                <p style="margin:0 0 4px 0;"><strong>📋 TOP 5 F&amp;O STOCKS (Highest Correction/Rally Time Ratio):</strong></p>
                 <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{top5_syms}</pre>
                 <p style="margin:0 0 14px 0;font-size:14px;color:#334155;">
-                    <strong>All Matched Stocks ({len(ordered)}):</strong> {all_syms}
+                    <strong>All Matched F&amp;O Stocks ({len(ordered)}):</strong> {all_syms}
                 </p>
                 <div style="overflow-x:auto;">
                     <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
@@ -646,14 +570,14 @@ def send_129m_pattern_email(triggered_list, bar_label, total_scanned):
                 server.login(SENDER_EMAIL, APP_PASSWORD)
                 server.send_message(msg)
 
-            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(ordered)} stock(s)!")
+            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(ordered)} F&O stock(s)!")
             return
         except Exception as e:
             print(f"⚠️ Email attempt {attempt}/3 failed: {e}")
             time.sleep(3)
 
 # ==============================================================================
-# 7. CORE SCANNER & 129-MINUTE MARKET CLOCK SCHEDULER
+# 7. CORE 129-MINUTE SCANNER & SCHEDULER
 # ==============================================================================
 def get_expected_129m_bar_label(now_ist):
     t = now_ist.time()
@@ -678,11 +602,12 @@ def run_129m_scanner(force_scan=False):
             return
 
     get_definedge_session_key()
-    eq_map, fut_map = load_definedge_tokens()
+    eq_map, fut_map = load_definedge_all_fno_tokens()
     token_map = eq_map if DATA_SEGMENT.upper() == "NSE" else fut_map
+    symbols_list = sorted(token_map.keys())
 
     start_dt = (now_ist - timedelta(days=LOOKBACK_DAYS_1M)).replace(hour=9, minute=15, second=0, microsecond=0)
-    print(f"\n🔎 Scanning {len(token_map)} High-Beta Stocks on 129m Timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
+    print(f"\n🔎 Scanning {len(symbols_list)} Active NSE F&O Stocks on 129m Timeframe (Target Bar: {expected_bar_label or 'LATEST'})...")
 
     def scan_single_stock(symbol):
         token = token_map.get(symbol)
@@ -705,8 +630,8 @@ def run_129m_scanner(force_scan=False):
             print(f"  ⚠️ Error scanning {symbol}: {e}")
         return None
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(scan_single_stock, high_beta_stocks))
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(scan_single_stock, symbols_list))
 
     triggered = sorted(
         [r for r in results if r is not None],
@@ -717,8 +642,8 @@ def run_129m_scanner(force_scan=False):
     for m in triggered:
         print(
             f"  🔥 MATCH: {m['symbol']} | Time Ratio [Corr/Rally]: {m['time_ratio']:.2f}x "
-            f"({m['corr_bars']}b / {m['rally_bars']}b) | WRB: {m['wrb_count']} "
-            f"(ATR2 Thrust: {m['max_wrb_atr2_ratio']}x prev, {m['max_wrb_vs_100']}x ATR100) | "
+            f"({m['corr_bars']}b / {m['rally_bars']}b | Rally: {m['rally_start_date']}->{m['rally_peak_date']}) | "
+            f"WRB: {m['wrb_count']} (ATR2 Thrust: {m['max_wrb_atr2_ratio']}x prev, {m['max_wrb_vs_100']}x ATR100) | "
             f"Red in Rally: {m['down_bars_in_rally']} | Retr: {m['retracement_pct']}% | StochK: {m['stoch_k']}"
         )
 
@@ -728,9 +653,9 @@ def run_129m_scanner(force_scan=False):
         save_memory(memory)
 
     if triggered:
-        send_129m_pattern_email(triggered, bar_label_used, len(token_map))
+        send_129m_pattern_email(triggered, bar_label_used, len(symbols_list))
     else:
-        print(f"ℹ️ No 129m Fresh WRB Rally + Slow Correction setups matched on bar [{bar_label_used}].")
+        print(f"ℹ️ No All-F&O 129m WRB Rally + Slow Correction setups matched on bar [{bar_label_used}].")
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -742,13 +667,13 @@ def heartbeat_sleep(target_dt):
 
 def stay_awake_129m_clock():
     now_ist = datetime.now(IST)
-    print(f"🕒 Starting 129m Fresh WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"🕒 Starting All-F&O 129m WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     is_weekday = now_ist.weekday() < 5
     in_market_window = is_weekday and (dtime(9, 10) <= now_ist.time() <= dtime(15, 35))
 
     if not in_market_window:
-        print("⚡ Running immediate single-pass 129m scan (outside live schedule window)...")
+        print("⚡ Running immediate single-pass All-F&O 129m scan (outside live schedule window)...")
         run_129m_scanner(force_scan=True)
         return
 
