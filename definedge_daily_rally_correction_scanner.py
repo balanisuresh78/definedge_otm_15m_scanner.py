@@ -50,9 +50,9 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "rally_corr_daily_memory.json"
 
 # ==============================================================================
-# DAILY (1D) NIFTY 500 "WRB RALLY + SLOW TIME-CORRECTION" PARAMETERS
+# DAILY (1D) ALL-F&O "WRB RALLY + SLOW TIME-CORRECTION" PARAMETERS
 # ==============================================================================
-DATA_SEGMENT = "NSE"                  # Scans Continuous NSE Cash Spot across Nifty 500
+DATA_SEGMENT = "NSE"                  # "NSE" (Continuous Spot Cash for all F&O stocks) or "NFO" (Futures)
 ATR_FAST_PERIOD = 2                   # ATR(2) for Wide-Range Bar thrust check
 ATR_SLOW_PERIOD = 100                 # ATR(100) baseline
 ATR_METHOD = "SMA"                    # "SMA" or "RMA"
@@ -85,66 +85,9 @@ SCAN_CHECKPOINTS_IST = [
     dtime(15, 30, 15)
 ]
 
-# ==============================================================================
-# BUILT-IN NIFTY 500 CONSTITUENT LIST (PLUS LIVE NSE ARCHIVE AUTO-UPDATE)
-# ==============================================================================
-FALLBACK_NIFTY_500_STOCKS = [
-    "360ONE", "3MINDIA", "ABB", "ACC", "AIAENG", "APLAPOLLO", "AUBANK", "AARTIIND", "AAVAS", "ABBOTINDIA",
-    "ACE", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ATGL", "AWL", "ABCAPITAL", "ABFRL",
-    "AEGISLOG", "AETHER", "AFFLE", "AJANTPHARM", "APLLTD", "ALKEM", "ALKYLAMINE", "ALLCARGO", "ALOKINDS", "ARE&M",
-    "AMBER", "AMBUJACEM", "ANANDRATHI", "ANGELONE", "ANURAS", "APARINDS", "APOLLOHOSP", "APOLLOTYRE", "APTUS", "ACI",
-    "ASAHIINDIA", "ASHOKLEY", "ASIANPAINT", "ASTERDM", "ASTRAL", "ATUL", "AUROPHARMA", "AVANTIFEED", "DMART", "AXISBANK",
-    "BEML", "BLS", "BSE", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BAJAJHLDNG", "BALAMINES", "BALKRISIND", "BALRAMCHIN",
-    "BANDHANBNK", "BANKBARODA", "BANKINDIA", "MAHABANK", "BATAINDIA", "BAYERCROP", "BERGEPAINT", "BDL", "BEL", "BHARATFORG",
-    "BHEL", "BPCL", "BHARTIARTL", "BIKAJI", "BIOCON", "BIRLACORPN", "BSOFT", "BLUEDART", "BLUESTARCO", "BBTC",
-    "BORORENEW", "BOSCHLTD", "BRIGADE", "BRITANNIA", "MAPMYINDIA", "CCL", "CESC", "CGPOWER", "CIEINDIA", "CRISIL",
-    "CSBBANK", "CAMPUS", "CANFINHOME", "CANBK", "CAPLIPOINT", "CGCL", "CARBORUNIV", "CASTROLIND", "CEATLTD", "CELLO",
-    "CENTRALBK", "CDSL", "CENTURYPLY", "CENTURYTEX", "CERA", "CHALET", "CHAMBLFERT", "CHEMPLASTS", "CHENNPETRO", "CHOLAHLDNG",
-    "CHOLAFIN", "CIPLA", "CUB", "CLEAN", "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL", "CAMS", "CONCORDBIO",
-    "CONCOR", "COROMANDEL", "CRAFTSMAN", "CREDITACC", "CROMPTON", "CUMMINSIND", "CYIENT", "DCMSHRIRAM", "DLF", "DOMS",
-    "DABUR", "DALBHARAT", "DATAPATTNS", "DEEPAKFERT", "DEEPAKNTR", "DELHIVERY", "DEVYANI", "DIVISLAB", "DIXON", "LALPATHLAB",
-    "DRREDDY", "EIDPARRY", "EIHOTEL", "EPL", "EASEMYTRIP", "EICHERMOT", "ELECON", "ELGIEQUIP", "EMAMILTD", "ENDURANCE",
-    "ENGINERSIN", "EQUITASBNK", "ERIS", "ESCORTS", "ETERNAL", "EXIDEIND", "FDC", "NYKAA", "FEDERALBNK", "FACT",
-    "FINEORG", "FINCABLES", "FINPIPE", "FSL", "FIVESTAR", "FORTIS", "GAIL", "GMMPFAUDLR", "GMRINFRA", "GRSE",
-    "GICRE", "GILLETTE", "GLAND", "GLAXO", "GLENMARK", "MEDANTA", "GODIGIT", "GPIL", "GODFRYPHLP", "GODREJCP",
-    "GODREJIND", "GODREJPROP", "GRANULES", "GRAPHITE", "GRASIM", "GESHIP", "GRINDWELL", "GAEL", "FLUOROCHEM", "GUJGASLTD",
-    "GMDCLTD", "GNFC", "GPPL", "GSFC", "GSPL", "HEG", "HBLPOWER", "HCLTECH", "HDFCAMC", "HDFCBANK",
-    "HDFCLIFE", "HFCL", "HAPPSTMNDS", "HAPPYFORGE", "HAVELLS", "HEROMOTOCO", "HSCL", "HINDALCO", "HAL", "HINDCOPPER",
-    "HINDPETRO", "HINDUNILVR", "HINDZINC", "POWERINDIA", "HOMEFIRST", "HONASA", "HONAUT", "HUDCO", "ICICIBANK", "ICICIGI",
-    "ICICIPRULI", "ISEC", "IDBI", "IDFCFIRSTB", "IFCI", "IIFL", "IRB", "IRCON", "ITC", "ITI",
-    "INDIACEM", "IBULHSGFIN", "INDIAMART", "INDIANB", "IEX", "INDHOTEL", "IOC", "IOB", "IRCTC", "IRFC",
-    "IREDA", "IGL", "INDUSTOWER", "INDUSINDBK", "NAUKRI", "INFY", "INOXWIND", "INTELLECT", "INDIGO", "IPCALAB",
-    "JBCHEPHARM", "JKCEMENT", "JBMA", "JKLAKSHMI", "JKPAPER", "JMFINANCIL", "JSWENERGY", "JSWINFRA", "JSWSTEEL", "JAIBALAJI",
-    "JAMNAAUTO", "JINDALSAW", "JSL", "JINDALSTEL", "JIOFIN", "JUBLFOOD", "JUBLINGREA", "JUBLPHARMA", "JWL", "JUSTDIAL",
-    "JYOTHYLAB", "JYOTICNC", "KPRMILL", "KEI", "KNRCON", "KPITTECH", "KRBL", "KSB", "KAJARIACER", "KPIL",
-    "KALYANJWL", "KANSAINER", "KARURVYSYA", "KAYNES", "KEC", "KFINTECH", "KOTAKBANK", "KIMS", "LTF", "LTTS",
-    "LICHSGFIN", "LTIM", "LT", "LATENTVIEW", "LAURUSLABS", "LXCHEM", "LEMONTREE", "LICI", "LINDEINDIA", "LLOYDSME",
-    "LUPIN", "MMTC", "MRF", "MTARTECH", "LODHA", "MGL", "MAHSEAMLES", "M&MFIN", "M&M", "MAHLIFE",
-    "MANAPPURAM", "MRPL", "MANKIND", "MARICO", "MARUTI", "MASTEK", "MFSL", "MAXHEALTH", "MAZDOCK", "MEDPLUS",
-    "METROBRAND", "METROPOLIS", "MINDACORP", "MSUMI", "MOTILALOFS", "MPHASIS", "MCX", "MUTHOOTFIN", "NATCOPHARM", "NBCC",
-    "NCC", "NHPC", "NLCINDIA", "NMDC", "NSLNISP", "NTPC", "NH", "NATIONALUM", "NAVINFLUOR", "NESTLEIND",
-    "NETWORK18", "NEWGEN", "NAM-INDIA", "NUVAMA", "NUVOCO", "OBEROIRLTY", "ONGC", "OIL", "OLECTRA", "PAYTM",
-    "OFSS", "POLICYBZR", "PCBL", "PIIND", "PNBHOUSING", "PNCINFRA", "PVRINOX", "PAGEIND", "PATANJALI", "PERSISTENT",
-    "PETRONET", "PFIZER", "PHOENIXLTD", "PIDILITIND", "PEL", "PPLPHARMA", "POLYMED", "POLYCAB", "POONAWALLA", "PFC",
-    "POWERGRID", "PRAJIND", "PRESTIGE", "PRINCEPIPE", "PRSMJOHNSN", "PGHH", "PNB", "QUESS", "RRKABEL", "RBLBANK",
-    "RECLTD", "RHIM", "RITES", "RADICO", "RVNL", "RAILTEL", "RAINBOW", "RAJESHEXPO", "RKFORGE", "RCF",
-    "RATNAMANI", "RTNINDIA", "RAYMOND", "REDINGTON", "RELIANCE", "RBA", "ROUTE", "SBFC", "SBICARD", "SBILIFE",
-    "SJVN", "SKFINDIA", "SRF", "SAFARI", "SAIL", "SANOFI", "SAPPHIRE", "SAREGAMA", "SCHAEFFLER", "SCHNEIDER",
-    "SHREECEM", "RENUKA", "SHRIRAMFIN", "SHYAMMETL", "SIEMENS", "SIGNATURE", "SOBHA", "SOLARINDS", "SONACOMS", "SONATSOFTW",
-    "STARHEALTH", "SBIN", "SAIL", "SWSOLAR", "STLTECH", "SUMICHEM", "SPARC", "SUNPHARMA", "SUNTV", "SUNDARMFIN",
-    "SUNDRMFAST", "SUPREMEIND", "SUVENPHAR", "SUZLON", "SWANENERGY", "SYNGENE", "SYRMA", "TBOTEK", "TVSMOTOR", "TVSSCS",
-    "TANLA", "TATACHEM", "TATACOMM", "TCS", "TATACONSUM", "TATAELXSI", "TATAINVEST", "TMPV", "TATAMOTORS", "TATAPOWER",
-    "TATASTEEL", "TATATECH", "TTML", "TECHM", "TEJASNET", "NIACL", "RAMCOCEM", "THERMAX", "TIMKEN", "TITAGARH",
-    "TITAN", "TORNTPHARM", "TORNTPOWER", "TRENT", "TRIDENT", "TRIVENI", "TRITURBINE", "TIINDIA", "UCOBANK", "UNOMINDA",
-    "UPL", "UTIAMC", "UJJIVANSFB", "ULTRACEMCO", "UNIONBANK", "UBL", "UNITDSPR", "USHAMART", "VGUARD", "VIPIND",
-    "VAIBHAVGBL", "VTL", "VARROC", "VBL", "MANYAVAR", "VEDL", "VIJAYA", "VINATIORGA", "IDEA", "VOLTAS",
-    "WELCORP", "WELSPUNLIV", "WESTLIFE", "WHIRLPOOL", "WIPRO", "YESBANK", "ZEEL", "ZENSARTECH", "ZOMATO", "ZYDUSLIFE",
-    "ECLERX"
-]
-
 SESSION_CACHE = {"key": "", "date": ""}
 
-# Shared HTTP Session with connection pooling for fast 500-stock scanning
+# Shared HTTP Session with connection pooling for fast scanning
 HTTP_SESSION = requests.Session()
 adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=2, backoff_factor=0.3))
 HTTP_SESSION.mount("https://", adapter)
@@ -171,7 +114,7 @@ def save_memory(mem):
         print(f"⚠️ Memory write warning: {e}")
 
 # ==============================================================================
-# 3. DEFINEDGE AUTH, NIFTY 500 UNIVERSE LOADER & DAILY DATA ENGINE
+# 3. DEFINEDGE AUTH, ALL-F&O DYNAMIC LOADER & DAILY DATA ENGINE
 # ==============================================================================
 def get_definedge_session_key(force_refresh=False):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -201,31 +144,12 @@ def get_definedge_session_key(force_refresh=False):
             time.sleep(4)
     raise RuntimeError("Could not authenticate with Definedge API.")
 
-def get_nifty_500_symbol_set():
-    """Fetches official Nifty 500 list from NSE Archives and merges with built-in 500 list."""
-    symbols = set(FALLBACK_NIFTY_500_STOCKS)
-    urls = [
-        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
-        "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for u in urls:
-        try:
-            r = HTTP_SESSION.get(u, headers=headers, timeout=10)
-            if r.status_code == 200 and "Symbol" in r.text:
-                df_n500 = pd.read_csv(io.StringIO(r.text))
-                if "Symbol" in df_n500.columns:
-                    live_syms = set(df_n500["Symbol"].dropna().astype(str).str.strip().tolist())
-                    if len(live_syms) >= 400:
-                        symbols.update(live_syms)
-                        print(f"📥 Loaded live Nifty 500 constituent list ({len(live_syms)} symbols).")
-                        break
-        except Exception:
-            pass
-    return symbols
-
-def load_definedge_nifty500_tokens():
-    nifty500_set = get_nifty_500_symbol_set()
+def load_definedge_all_fno_tokens():
+    """
+    Dynamically extracts ALL active NSE Stock Futures (FUTSTK) underlyings from Definedge Master
+    and maps each F&O stock to its NSE Cash (EQ) token and near-month Futures token.
+    """
+    today = datetime.now(IST).date()
 
     url = "https://app.definedgesecurities.com/public/allmaster.zip"
     resp = HTTP_SESSION.get(url, timeout=30)
@@ -236,14 +160,37 @@ def load_definedge_nifty500_tokens():
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
+    # 1. Find all active Stock Futures (FUTSTK) in NFO segment
+    nfo_fut = df[
+        (df[0] == "NFO")
+        & (df[4].str.strip() == "FUTSTK")
+    ].copy()
+    nfo_fut[1] = nfo_fut[1].str.strip()
+    nfo_fut[2] = nfo_fut[2].str.strip()
+
+    for exp_col in [5, 8, 6, 7]:
+        if exp_col in nfo_fut.columns:
+            parsed = pd.to_datetime(nfo_fut[exp_col].str.strip().str.zfill(8), format="%d%m%Y", errors="coerce")
+            if parsed.notna().sum() > 0:
+                nfo_fut["expiry"] = parsed.dt.date
+                break
+
+    nfo_fut = nfo_fut[nfo_fut["expiry"].notna() & (nfo_fut["expiry"] >= today)]
+    fut_near = nfo_fut.sort_values("expiry").groupby(2, as_index=False).first()
+    fut_map = {row[2]: row[1] for _, row in fut_near.iterrows()}
+
+    all_fno_symbols = set(fut_map.keys())
+
+    # 2. Map all F&O underlyings to their NSE Cash (EQ) tokens
     nse_eq = df[
         (df[0] == "NSE")
-        & (df[2].str.strip().isin(nifty500_set))
+        & (df[2].str.strip().isin(all_fno_symbols))
         & (df[4].str.strip() == "EQ")
     ].copy()
     eq_map = {row[2].strip(): row[1].strip() for _, row in nse_eq.iterrows()}
-    print(f"✅ Mapped {len(eq_map)} Nifty 500 NSE Cash (EQ) stocks from Definedge Master.")
-    return eq_map
+
+    print(f"✅ Dynamically loaded {len(eq_map)} active NSE F&O stocks from Definedge Master.")
+    return eq_map, fut_map
 
 def fetch_definedge_day_df(segment, token, start_dt, end_dt):
     from_str = start_dt.strftime("%d%m%Y%H%M")
@@ -317,10 +264,6 @@ def compute_indicators_daily(df_day):
     df["stoch_d"] = df["stoch_k"].rolling(3, min_periods=3).mean()
 
     # Bullish Wide-Range Bar (WRB):
-    # 1. Bullish candle (Close > Open and Close > Prev Close)
-    # 2. ATR(2) >= 1.5x Previous Bar's ATR(2)
-    # 3. ATR(2) >= 1.05x ATR(100) (ATR 2 line sits above ATR 100 line)
-    # 4. Bullish Body >= 0.75x ATR(100)
     df["is_bull_wrb"] = (
         (df["close"] > df["open"])
         & (df["close"] > prev_close)
@@ -334,15 +277,6 @@ def compute_indicators_daily(df_day):
 # 5. PATTERN DETECTOR: WRB-ANCHORED IMPULSE RALLY + SLOWER TIME-CORRECTION
 # ==============================================================================
 def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_idx):
-    """
-    Evaluates [start_idx .. peak_idx] as the Impulse Rally and [peak_idx + 1 .. end_corr_idx]
-    as the Slow Time-Correction:
-      - `start_idx` is anchored directly to the first Bullish WRB (or the single bullish bar
-        immediately before the first WRB) so prior sideways base bars are NEVER mixed in.
-      - Rally has >= 1 Bullish WRB (ATR2 >= 1.5x Prev ATR2) and 0..3 small-body red bars.
-      - Correction consumes strictly MORE days than the rally (corr_bars > rally_bars)
-        and holds strictly above the starting low of the rally.
-    """
     rally_bars = peak_idx - start_idx + 1
     corr_bars = end_corr_idx - peak_idx
 
@@ -371,7 +305,6 @@ def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_id
 
     # 2. Peak bar must be the highest point of the rally
     rally_peak_high = float(rally_slice.iloc[-1]["high"])
-    rally_peak_close = float(rally_slice.iloc[-1]["close"])
     if float(rally_slice["high"].max()) > rally_peak_high:
         return None
 
@@ -386,12 +319,10 @@ def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_id
     if len(prior_slice) < 10:
         return None
 
-    # Rally peak must break out above the prior 15 bars before the rally started
     recent_prior = df.iloc[max(0, start_idx - 15) : start_idx]
     if float(recent_prior["high"].max()) >= rally_peak_high:
         return None
 
-    # Rally Start Low must be in the lower 65% of the prior 20-bar range
     context_high = max(float(prior_slice["high"].max()), rally_peak_high)
     context_low = min(float(prior_slice["low"].min()), rally_start_low)
     if (context_high - context_low) > 0:
@@ -431,11 +362,9 @@ def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_id
     corr_high = float(corr_slice["high"].max())
     cur_close = float(corr_slice["close"].iloc[-1])
 
-    # Must hold strictly above the starting point of the rally
     if corr_low <= rally_start_low:
         return None
 
-    # Correction must not have already closed above the rally peak high (still correcting/coiling)
     if corr_max_close > rally_peak_high or corr_high > (rally_peak_high + 0.10 * rally_range):
         return None
 
@@ -443,7 +372,6 @@ def check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, end_corr_id
     if retracement_pct < (MIN_RETRACEMENT_OF_RALLY * 100.0) or retracement_pct > (MAX_RETRACEMENT_OF_RALLY * 100.0):
         return None
 
-    # Current price should still be below the rally peak (in correction / flag zone)
     if cur_close >= rally_peak_high or cur_close <= rally_start_low:
         return None
 
@@ -479,7 +407,6 @@ def evaluate_daily_rally_slow_correction(df_day):
 
     for peak_idx in range(cur_idx - 2, min_peak_idx - 1, -1):
         min_start_idx = max(PRIOR_BASE_LOOKBACK, peak_idx - MAX_RALLY_BARS + 1)
-        # Anchor to the earliest valid WRB start_idx for this peak (full impulse rally leg)
         full_rally_for_peak = None
         for start_idx in range(min_start_idx, peak_idx + 1):
             res = check_wrb_anchored_rally_and_correction(df, start_idx, peak_idx, cur_idx)
@@ -509,7 +436,7 @@ def evaluate_daily_rally_slow_correction(df_day):
 # ==============================================================================
 def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
-    subject = f"🔥 Nifty 500 Daily (1D) WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
+    subject = f"🔥 All-F&O Daily (1D) WRB Rally + Slow Correction ({len(triggered_list)} Matches) - [{bar_label}] ({now_str})"
 
     ordered = sorted(
         triggered_list,
@@ -521,7 +448,7 @@ def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
     all_syms = ", ".join([m["symbol"] for m in ordered]) or "None"
 
     headers = [
-        "Stock",
+        "F&O Stock",
         "Time Ratio (Corr/Rally)",
         "Corr Days",
         "Rally Days (WRB | Red)",
@@ -574,16 +501,16 @@ def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 Nifty 500 Daily (1D) WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>🔥 All-F&amp;O Daily (1D) WRB Impulse Rally + Slow Time-Correction (Sorted by Max Time Ratio)</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>Daily Candle:</strong> {bar_label} &nbsp;|&nbsp;
-                    <strong>Universe Scanned:</strong> {total_scanned} Nifty 500 Stocks &nbsp;|&nbsp;
+                    <strong>Universe Scanned:</strong> {total_scanned} NSE F&amp;O Stocks &nbsp;|&nbsp;
                     <strong>Matches:</strong> {len(ordered)}
                 </p>
-                <p style="margin:0 0 4px 0;"><strong>📋 TOP 5 STOCKS (Highest Correction/Rally Time Ratio):</strong></p>
+                <p style="margin:0 0 4px 0;"><strong>📋 TOP 5 F&amp;O STOCKS (Highest Correction/Rally Time Ratio):</strong></p>
                 <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{top5_syms}</pre>
                 <p style="margin:0 0 14px 0;font-size:14px;color:#334155;">
-                    <strong>All Matched Stocks ({len(ordered)}):</strong> {all_syms}
+                    <strong>All Matched F&amp;O Stocks ({len(ordered)}):</strong> {all_syms}
                 </p>
                 <div style="overflow-x:auto;">
                     <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
@@ -606,7 +533,7 @@ def send_daily_pattern_email(triggered_list, bar_label, total_scanned):
                 server.login(SENDER_EMAIL, APP_PASSWORD)
                 server.send_message(msg)
 
-            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(ordered)} stock(s)!")
+            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(ordered)} F&O stock(s)!")
             return
         except Exception as e:
             print(f"⚠️ Email attempt {attempt}/3 failed: {e}")
@@ -620,11 +547,12 @@ def run_daily_scanner(force_scan=False):
     memory = load_memory()
 
     get_definedge_session_key()
-    token_map = load_definedge_nifty500_tokens()
+    eq_map, fut_map = load_definedge_all_fno_tokens()
+    token_map = eq_map if DATA_SEGMENT.upper() == "NSE" else fut_map
     symbols_list = sorted(token_map.keys())
 
     start_dt = (now_ist - timedelta(days=LOOKBACK_DAYS_DAILY)).replace(hour=9, minute=15, second=0, microsecond=0)
-    print(f"\n🔎 Scanning {len(symbols_list)} Nifty 500 Stocks on DAILY (1D) Timeframe...")
+    print(f"\n🔎 Scanning {len(symbols_list)} Active NSE F&O Stocks on DAILY (1D) Timeframe...")
 
     def scan_single_stock(symbol):
         token = token_map.get(symbol)
@@ -670,7 +598,7 @@ def run_daily_scanner(force_scan=False):
     if triggered:
         send_daily_pattern_email(triggered, bar_label_used, len(symbols_list))
     else:
-        print(f"ℹ️ No Daily (1D) WRB Rally + Slow Correction setups matched on [{bar_label_used}].")
+        print(f"ℹ️ No All-F&O Daily (1D) WRB Rally + Slow Correction setups matched on [{bar_label_used}].")
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -682,13 +610,13 @@ def heartbeat_sleep(target_dt):
 
 def stay_awake_daily_clock():
     now_ist = datetime.now(IST)
-    print(f"🕒 Starting Nifty 500 Daily (1D) WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"🕒 Starting All-F&O Daily (1D) WRB Rally + Slow Correction Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     is_weekday = now_ist.weekday() < 5
     in_pre_close_window = is_weekday and (dtime(15, 0) <= now_ist.time() <= dtime(15, 35))
 
     if not in_pre_close_window:
-        print("⚡ Running immediate single-pass Nifty 500 Daily (1D) scan...")
+        print("⚡ Running immediate single-pass All-F&O Daily (1D) scan...")
         run_daily_scanner(force_scan=True)
         return
 
