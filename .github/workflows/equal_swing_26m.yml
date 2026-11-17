@@ -1,0 +1,65 @@
+name: 26m Options Equal Down-Swing Scanner
+
+on:
+  schedule:
+    # Morning Session: Starts 09:15 AM IST (03:45 UTC) -> covers 09:41 to 12:43 IST bars
+    - cron: '45 3 * * 1-5'
+    # Afternoon Session: Starts 12:45 PM IST (07:15 UTC) -> covers 13:09 to 15:30 IST bars
+    - cron: '15 7 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: equal-swing-26m-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan-26m-equal-swings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore equal_swing_26m_memory.json from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: equal_swing_26m_memory.json
+          key: equal-swing-26m-mem-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            equal-swing-26m-mem-${{ runner.os }}-
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy pyotp pytz tabulate
+
+      - name: Run 26m Equal Down-Swing Option Clock
+        env:
+          TZ: Asia/Kolkata
+          DEFINEDGE_API_TOKEN: ${{ secrets.DEFINEDGE_API_TOKEN }}
+          DEFINEDGE_API_SECRET: ${{ secrets.DEFINEDGE_API_SECRET }}
+          DEFINEDGE_TOTP_SECRET: ${{ secrets.DEFINEDGE_TOTP_SECRET }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: |
+          python definedge_26m_equal_swing_scanner.py
+
+      - name: Save equal_swing_26m_memory.json to Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: equal_swing_26m_memory.json
+          key: equal-swing-26m-mem-${{ runner.os }}-${{ github.run_id }}
