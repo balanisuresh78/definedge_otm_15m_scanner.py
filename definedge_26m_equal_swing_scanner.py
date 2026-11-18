@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import io
 import json
@@ -17,6 +18,12 @@ from datetime import datetime, timedelta, time as dtime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from tabulate import tabulate
+
+# Force real-time unbuffered console logging in GitHub Actions
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ==============================================================================
 # 1. CREDENTIALS & CONFIGURATION (GITHUB ACTIONS SECRETS + FALLBACKS)
@@ -49,36 +56,39 @@ APP_PASSWORD = (
 
 IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "equal_swing_26m_memory.json"
-BASKET_VERSION = "v2_26m_highest_oi_strict_no_breach"
+BASKET_VERSION = "v3_26m_highest_oi_unmerged_swings"
 
 # ==============================================================================
 # 26-MINUTE EQUAL DOWN-SWING PATTERN PARAMETERS (STRICT NON-BREACH RULES)
 # ==============================================================================
-# Outside live market hours, scan all 15 of today's 26m bars (excluding post-trigger breaches):
-AFTER_HOURS_SCAN_ALL_TODAY_BARS = True
+# Always scan all completed 26m bars of today's session on startup / manual runs:
+SCAN_ALL_COMPLETED_TODAY_BARS = True
+# Send a confirmation email on the initial startup pass even if 0 contracts match:
+SEND_HEARTBEAT_EMAIL_ON_FIRST_SCAN = True
 
 # Corrective Down-Swing Rules
 MIN_RED_BARS_PER_SWING = 3            # Minimum 3 red (down) bars in each corrective swing
-MAX_RED_BARS_PER_SWING = 9            # Maximum red bars in a single corrective swing
+MAX_RED_BARS_PER_SWING = 8            # Maximum red bars in a single corrective swing
 MAX_BLUE_BARS_IN_SWING = 2            # Allow 1-2 small blue/pause bars inside a down swing
 MAX_INTERNAL_BLUE_BODY_RATIO = 0.60   # Internal blue bar body must be <= 60% of max red body in that swing
+MAX_INTERNAL_BLUE_RECOV_RATIO = 0.30  # Internal blue pause bar cannot recover >= 30% of drop (otherwise it's a bounce!)
 
 # Preceding Impulse Rally 1 Rules (Before Swing 1)
-MAX_RALLY1_LOOKBACK_BARS = 10         # Max bars to trace back to find Rally 1's starting base low (r1_low)
-MAX_SWING1_RETRACE_OF_RALLY1 = 0.85   # Swing 1 low (L1) must hold above Rally 1 base (<= 85% retracement)
-MIN_SWING1_RETRACE_OF_RALLY1 = 0.20   # Swing 1 must retrace at least 20% of Rally 1 (meaningful pullback)
+MAX_RALLY1_LOOKBACK_BARS = 12         # Max bars to trace back to find Rally 1's starting base low (r1_low)
+MAX_SWING1_RETRACE_OF_RALLY1 = 0.88   # Swing 1 low (L1) must hold above Rally 1 base (<= 88% retracement)
+MIN_SWING1_RETRACE_OF_RALLY1 = 0.15   # Swing 1 must retrace at least 15% of Rally 1
 
 # Inter-Swing Bounce (Rally 2: L1 -> H2) & Swing 2 Non-Breach Rules
 MIN_BOUNCE_BARS = 1                   # Minimum bars in the bounce rally between Down Swing 1 and Down Swing 2
 MAX_BOUNCE_BARS = 8                   # Maximum bars in the bounce rally between Down Swing 1 and Down Swing 2
-MIN_BOUNCE_RECOVERY_RATIO = 0.40      # Rally 2 High (H2) must recover at least 40% of Swing 1's drop (H1 - L1)
-MAX_BOUNCE_RECOVERY_RATIO = 1.35      # Rally 2 High (H2) stays within 135% of Swing 1's drop
-MAX_SWING2_RETRACE_OF_RALLY2 = 0.88   # Swing 2 low (L2) must NOT breach Rally 2 start low L1 (<= 88% retrace)
-MIN_SWING2_DROP_VS_SWING1 = 0.35      # Swing 2 drop (H2 - L2) must be at least 35% of Swing 1 drop
-SUPPORT_TICK_TOLERANCE = 0.99         # L2 must be >= 99% of L1 (never breaches preceding swing low)
+MIN_BOUNCE_RECOVERY_RATIO = 0.30      # Rally 2 High (H2) must recover at least 30% of Swing 1's drop (H1 - L1)
+MAX_BOUNCE_RECOVERY_RATIO = 1.45      # Rally 2 High (H2) stays within 145% of Swing 1's drop
+MAX_SWING2_RETRACE_OF_RALLY2 = 0.90   # Swing 2 low (L2) must NOT breach Rally 2 start low L1 (<= 90% retrace)
+MIN_SWING2_DROP_VS_SWING1 = 0.30      # Swing 2 drop (H2 - L2) must be at least 30% of Swing 1 drop
+SUPPORT_TICK_TOLERANCE = 0.985        # L2 must be >= 98.5% of L1 (never breaches preceding swing low)
 
-# Highest OI Option Selection Window per Stock
-STRIKES_TO_CHECK_PER_SIDE = 10        # Checks 2 ATM/ITM + 8 OTM strikes per side to lock in Highest OI CE & PE
+# Highest OI Option Selection Window per Stock (Fast 6-Strike Core Window per Side)
+STRIKES_TO_CHECK_PER_SIDE = 6         # Checks 1 ITM + ATM + 4 OTM strikes per side for fast ~2.5 min basket build
 LOOKBACK_DAYS_1M = 12                 # 12 calendar days (~7-8 trading days = ~115 bars of 26m data)
 
 # All 15 Daily 26-Minute Candle Close Checkpoints (09:15 origin):
@@ -126,7 +136,7 @@ high_beta_stocks = [
 SESSION_CACHE = {"key": "", "date": ""}
 
 HTTP_SESSION = requests.Session()
-adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=Retry(total=2, backoff_factor=0.3))
+adapter = HTTPAdapter(pool_connections=24, pool_maxsize=24, max_retries=Retry(total=2, backoff_factor=0.3))
 HTTP_SESSION.mount("https://", adapter)
 HTTP_SESSION.mount("http://", adapter)
 
@@ -145,7 +155,7 @@ def load_memory():
             with open(MEMORY_FILE, "r") as f:
                 default_mem.update(json.load(f))
         except Exception as e:
-            print(f"⚠️ Memory read warning: {e}")
+            print(f"⚠️ Memory read warning: {e}", flush=True)
     return default_mem
 
 def save_memory(mem):
@@ -153,7 +163,7 @@ def save_memory(mem):
         with open(MEMORY_FILE, "w") as f:
             json.dump(mem, f, indent=2)
     except Exception as e:
-        print(f"⚠️ Memory write warning: {e}")
+        print(f"⚠️ Memory write warning: {e}", flush=True)
 
 # ==============================================================================
 # 3. DEFINEDGE AUTHENTICATION & HISTORICAL DATA ENGINE
@@ -179,10 +189,10 @@ def get_definedge_session_key(force_refresh=False):
             if session_key:
                 SESSION_CACHE["key"] = session_key
                 SESSION_CACHE["date"] = today_str
-                print("🔑 Definedge session authenticated.")
+                print("🔑 Definedge session authenticated.", flush=True)
                 return session_key
         except Exception as e:
-            print(f"⚠️ Definedge login attempt {attempt}/3 failed: {e}")
+            print(f"⚠️ Definedge login attempt {attempt}/3 failed: {e}", flush=True)
             time.sleep(4)
     raise RuntimeError("Could not authenticate with Definedge API.")
 
@@ -194,7 +204,7 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=20)
+            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=15)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
@@ -220,7 +230,7 @@ def fetch_definedge_day_df(segment, token, start_dt, end_dt):
             df["volume"] = df["volume"].fillna(0)
             return df.dropna(subset=["open", "high", "low", "close"]).drop_duplicates(subset=["date"], keep="last")
         except Exception:
-            time.sleep(1.5)
+            time.sleep(1.0)
     return pd.DataFrame()
 
 def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
@@ -231,7 +241,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     for attempt in range(1, 3):
         session_key = get_definedge_session_key(force_refresh=(attempt > 1))
         try:
-            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=25)
+            resp = HTTP_SESSION.get(url, headers={"Authorization": session_key}, timeout=20)
             if resp.status_code == 401:
                 continue
             if resp.status_code != 200 or not resp.text.strip():
@@ -258,7 +268,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
             df["volume"] = df["volume"].fillna(0)
             return df.dropna(subset=["open", "high", "low", "close"])
         except Exception:
-            time.sleep(1.5)
+            time.sleep(1.0)
     return pd.DataFrame()
 
 # ==============================================================================
@@ -370,12 +380,15 @@ def pick_highest_oi_contract(candidates, start_dt_opt, now_ist):
     return best_cand
 
 def build_highest_oi_ce_pe_basket(now_ist):
-    print(f"\n🎯 Building Highest Open Interest CE & PE Basket across {len(high_beta_stocks)} F&O Stocks...")
+    print(f"\n🎯 Building Highest Open Interest CE & PE Basket across {len(high_beta_stocks)} F&O Stocks...", flush=True)
     get_definedge_session_key()
     fut_map, options_by_stock = load_definedge_master_chains()
-    start_dt_opt = (now_ist - timedelta(days=12)).replace(hour=9, minute=15, second=0, microsecond=0)
+    start_dt_opt = (now_ist - timedelta(days=10)).replace(hour=9, minute=15, second=0, microsecond=0)
+
+    completed_count = 0
 
     def select_stock_highest_oi_pair(symbol):
+        nonlocal completed_count
         fut_info = fut_map.get(symbol)
         chain = options_by_stock.get(symbol, [])
         if not fut_info or not chain:
@@ -392,11 +405,11 @@ def build_highest_oi_ce_pe_basket(now_ist):
         pe_all = sorted([o for o in chain if o["opt_type"] == "PE"], key=lambda x: x["strike"], reverse=True)
 
         ce_otm = [o for o in ce_all if o["strike"] >= ref_price]
-        ce_itm = [o for o in ce_all if o["strike"] < ref_price][-2:]
+        ce_itm = [o for o in ce_all if o["strike"] < ref_price][-1:]
         ce_cands = (ce_itm + ce_otm)[:STRIKES_TO_CHECK_PER_SIDE]
 
         pe_otm = [o for o in pe_all if o["strike"] <= ref_price]
-        pe_itm = [o for o in pe_all if o["strike"] > ref_price][-2:]
+        pe_itm = [o for o in pe_all if o["strike"] > ref_price][-1:]
         pe_cands = (pe_itm + pe_otm)[:STRIKES_TO_CHECK_PER_SIDE]
 
         selected = []
@@ -410,15 +423,19 @@ def build_highest_oi_ce_pe_basket(now_ist):
             best_pe["ref_fut_price"] = round(ref_price, 2)
             selected.append(best_pe)
 
+        completed_count += 1
+        if completed_count % 25 == 0:
+            print(f"  ⏳ Basket progress: {completed_count}/{len(high_beta_stocks)} stocks processed...", flush=True)
+
         return selected
 
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         results = list(executor.map(select_stock_highest_oi_pair, high_beta_stocks))
 
     basket = [opt for pair in results for opt in pair]
     ce_cnt = sum(1 for o in basket if o["opt_type"] == "CE")
     pe_cnt = sum(1 for o in basket if o["opt_type"] == "PE")
-    print(f"✅ Basket Locked: {len(basket)} Contracts ({ce_cnt} Highest-OI CEs + {pe_cnt} Highest-OI PEs).")
+    print(f"✅ Basket Locked: {len(basket)} Contracts ({ce_cnt} Highest-OI CEs + {pe_cnt} Highest-OI PEs).", flush=True)
     return basket
 
 # ==============================================================================
@@ -473,42 +490,38 @@ def resample_to_26m(df_1m, now_ist):
     return df_26m
 
 # ==============================================================================
-# 6. PATTERN DETECTOR: STRICT NON-BREACH EQUAL DOWN-SWINGS (N >= 3 RED BARS)
+# 6. PATTERN DETECTOR: STRICT NON-BREACH EQUAL DOWN-SWINGS (UNMERGED SWINGS)
 # ==============================================================================
-def find_full_down_swing_ending_at(df, s_end):
+def find_all_valid_down_swings_ending_at(df, s_end):
     """
-    Finds the unique, full corrective down swing ending at red bar `s_end` by
-    anchoring `s_start` to the true preceding swing-high peak (preventing
-    sub-swing slicing at small internal blue pause bars).
+    Returns ALL valid candidate down swings ending at red bar `s_end`
+    (ordered from cleanest/shortest to longest) and prevents any internal
+    blue pause bar from swallowing a genuine inter-swing bounce!
     """
     max_len = MAX_RED_BARS_PER_SWING + MAX_BLUE_BARS_IN_SWING
     if s_end < MIN_RED_BARS_PER_SWING + 2:
-        return None
+        return []
 
     last_bar = df.iloc[s_end]
     if float(last_bar["close"]) >= float(last_bar["open"]):
-        return None
+        return []
 
-    # Walk backward from s_end to find the start of the down-leg right after a local peak
     earliest_idx = max(2, s_end - max_len + 1)
-    best_candidate = None
+    latest_idx = s_end - MIN_RED_BARS_PER_SWING + 1
+    candidates = []
 
-    for s_start in range(earliest_idx, s_end - MIN_RED_BARS_PER_SWING + 2):
+    # Iterate from shortest/most-recent s_start to earliest s_start so Swing 2 never swallows Swing 1
+    for s_start in range(latest_idx, earliest_idx - 1, -1):
         prev_bar = df.iloc[s_start - 1]
         first_bar = df.iloc[s_start]
 
-        # Down swing must start on a red bar immediately following a bullish (blue) peak bar
+        # Must start on a red bar preceded by a bullish (blue) peak bar
         if float(prev_bar["close"]) <= float(prev_bar["open"]):
             continue
         if float(first_bar["close"]) >= float(first_bar["open"]):
             continue
 
-        # Anti-Slicing Check: `prev_bar` (or `first_bar`) must be a true local swing high,
-        # NOT a small internal blue pause bar inside an already-falling leg!
         peak_high = max(float(prev_bar["high"]), float(first_bar["high"]))
-        prior_2_high = float(df.iloc[max(0, s_start - 3) : s_start - 1]["high"].max()) if s_start >= 2 else 0.0
-        if prior_2_high > peak_high * 1.01:
-            continue
 
         sub = df.iloc[s_start : s_end + 1]
         opens = sub["open"].values
@@ -532,28 +545,43 @@ def find_full_down_swing_ending_at(df, s_end):
         if max_red_body <= 0:
             continue
 
-        # Any internal blue pause bar (1-2 allowed) must have a small body AND must not make a higher high
+        swing_low = float(np.min(lows))
+        swing_drop = peak_high - swing_low
+        if swing_drop <= 0:
+            continue
+
+        # Anti-Merging Check: Any internal blue pause bar must have a small body AND
+        # cannot be a bounce that recovers >= 30% of the drop so far
         if blue_count > 0:
             max_blue_body = float(np.max(bodies[pause_mask]))
             if max_blue_body > (MAX_INTERNAL_BLUE_BODY_RATIO * max_red_body):
                 continue
 
-        # No bar inside the down swing can exceed the starting swing high
-        if float(np.max(highs)) > peak_high * 1.01:
+            # Check if any internal blue bar recovered >= 30% from the lowest low prior to it
+            is_real_bounce_inside = False
+            for k in range(1, len(sub) - 1):
+                if pause_mask[k]:
+                    low_so_far = float(np.min(lows[:k]))
+                    drop_so_far = peak_high - low_so_far
+                    if drop_so_far > 0 and ((highs[k] - low_so_far) / drop_so_far) >= MAX_INTERNAL_BLUE_RECOV_RATIO:
+                        is_real_bounce_inside = True
+                        break
+            if is_real_bounce_inside:
+                continue
+
+        # No bar inside the down swing can exceed the starting peak high
+        if float(np.max(highs)) > peak_high * 1.015:
             continue
 
         # Swing Low must occur at the completion of the down swing (s_end or s_end - 1)
-        swing_low = float(np.min(lows))
         end_low = min(float(lows[-1]), float(lows[max(0, len(lows) - 2)]))
-        if end_low > swing_low * 1.02:
+        if end_low > swing_low * 1.03:
             continue
 
-        # Net downward progress check: completing red bar close must be below lowest open/close at start
-        swing_drop = peak_high - swing_low
-        if float(last_bar["close"]) >= float(first_bar["close"]) or swing_drop <= 0:
+        if float(last_bar["close"]) >= float(first_bar["open"]):
             continue
 
-        best_candidate = {
+        candidates.append({
             "s_start": s_start,
             "s_end": s_end,
             "red_count": red_count,
@@ -563,11 +591,9 @@ def find_full_down_swing_ending_at(df, s_end):
             "swing_drop": round(swing_drop, 2),
             "start_time": df.index[s_start].strftime("%d-%b %H:%M"),
             "end_time": df.index[s_end].strftime("%d-%b %H:%M")
-        }
-        # Break at the earliest valid s_start (the true full top-to-bottom swing leg)
-        break
+        })
 
-    return best_candidate
+    return candidates
 
 def find_preceding_impulse_rally(df, swing_info):
     """
@@ -585,12 +611,10 @@ def find_preceding_impulse_rally(df, swing_info):
     if rally_window.empty:
         return None
 
-    # Locate the lowest low in the impulse window preceding peak_idx
     rel_min_idx = int(np.argmin(rally_window["low"].values))
     r_start = lookback_start + rel_min_idx
     r_low = float(df["low"].iloc[r_start])
 
-    # Ensure there is at least 1 bullish bar launching from r_start to peak_idx
     leg_slice = df.iloc[r_start : peak_idx + 1]
     if int(np.sum(leg_slice["close"].values > leg_slice["open"].values)) < 1:
         return None
@@ -621,12 +645,6 @@ def find_preceding_impulse_rally(df, swing_info):
     }
 
 def validate_inter_swing_rally_and_support(df, s1_info, s2_info, r1_low):
-    """
-    Enforces that:
-      1. Between Swing 1 (s1_end) and Swing 2 (s2_start), price made a genuine bullish
-         bounce rally (Rally 2: L1 -> H2) without breaching L1 or r1_low.
-      2. Swing 2's low (L2) NEVER breaches Rally 2's starting low (L1) or Rally 1's low (r1_low).
-    """
     s1_end = s1_info["s_end"]
     s2_start = s2_info["s_start"]
 
@@ -650,20 +668,17 @@ def validate_inter_swing_rally_and_support(df, s1_info, s2_info, r1_low):
     if bounce_min_low < (l1 * SUPPORT_TICK_TOLERANCE) or bounce_min_low <= r1_low:
         return False
 
-    # 2. Rally 2 High (H2) must recover at least 40% of Swing 1's drop, up to 135%
+    # 2. Rally 2 High (H2) must recover at least 30% of Swing 1's drop, up to 145%
     rally2_range = h2 - l1
     bounce_recovery = rally2_range / drop1 if drop1 > 0 else 0.0
     if bounce_recovery < MIN_BOUNCE_RECOVERY_RATIO or bounce_recovery > MAX_BOUNCE_RECOVERY_RATIO:
         return False
 
-    # 3. Swing 2 drop (H2 - L2) must be proportional (at least 35% of Swing 1 drop)
+    # 3. Swing 2 drop (H2 - L2) must be proportional (at least 30% of Swing 1 drop)
     if (drop2 / drop1) < MIN_SWING2_DROP_VS_SWING1:
         return False
 
     # 4. STRICT NON-BREACH OF PRECEDING RALLY LOW:
-    #    - Swing 2 starts after Rally 2 (which launched from L1 to H2).
-    #    - Therefore, Swing 2's low (L2) MUST hold above L1 (and strictly above r1_low),
-    #      retracing at most 88% of Rally 2!
     if l2 <= r1_low or l2 < (l1 * SUPPORT_TICK_TOLERANCE):
         return False
 
@@ -675,62 +690,70 @@ def validate_inter_swing_rally_and_support(df, s1_info, s2_info, r1_low):
 
 def evaluate_26m_at_bar_index(df_26m, cur_idx):
     """
-    Evaluates whether bar `cur_idx` completes a 2nd (or 3rd) Equal Down-Swing
-    where NO down swing breaches the low of its preceding rally.
+    Tests all valid unmerged Swing 2 candidates ending at `cur_idx` against
+    preceding Swing 1 candidates with the exact same number of red bars (N == N >= 3).
     """
-    if cur_idx < 15:
+    if cur_idx < 14:
         return None
 
-    s2_info = find_full_down_swing_ending_at(df_26m, cur_idx)
-    if not s2_info:
+    s2_candidates = find_all_valid_down_swings_ending_at(df_26m, cur_idx)
+    if not s2_candidates:
         return None
 
-    target_red_count = s2_info["red_count"]
-    s2_start = s2_info["s_start"]
-
+    best_s2 = None
     matched_s1 = None
     matched_r1 = None
 
-    for s1_end in range(s2_start - MIN_BOUNCE_BARS - 1, max(4, s2_start - MAX_BOUNCE_BARS - 2), -1):
-        cand_s1 = find_full_down_swing_ending_at(df_26m, s1_end)
-        if not cand_s1 or cand_s1["red_count"] != target_red_count:
-            continue
+    for s2_info in s2_candidates:
+        target_red_count = s2_info["red_count"]
+        s2_start = s2_info["s_start"]
 
-        cand_r1 = find_preceding_impulse_rally(df_26m, cand_s1)
-        if not cand_r1:
-            continue
+        for s1_end in range(s2_start - MIN_BOUNCE_BARS - 1, max(4, s2_start - MAX_BOUNCE_BARS - 2), -1):
+            s1_candidates = find_all_valid_down_swings_ending_at(df_26m, s1_end)
+            for cand_s1 in s1_candidates:
+                if cand_s1["red_count"] != target_red_count:
+                    continue
 
-        if validate_inter_swing_rally_and_support(df_26m, cand_s1, s2_info, cand_r1["r_low"]):
-            matched_s1 = cand_s1
-            matched_r1 = cand_r1
+                cand_r1 = find_preceding_impulse_rally(df_26m, cand_s1)
+                if not cand_r1:
+                    continue
+
+                if validate_inter_swing_rally_and_support(df_26m, cand_s1, s2_info, cand_r1["r_low"]):
+                    best_s2 = s2_info
+                    matched_s1 = cand_s1
+                    matched_r1 = cand_r1
+                    break
+            if matched_s1:
+                break
+        if matched_s1:
             break
 
-    if not matched_s1 or not matched_r1:
+    if not best_s2 or not matched_s1 or not matched_r1:
         return None
 
-    # Bonus Check: Did an earlier Swing 0 also have the exact same target_red_count (3 Equal Swings)?
+    target_red_count = best_s2["red_count"]
     swing_count = 2
     s1_start = matched_s1["s_start"]
     base_rally_info = matched_r1
 
+    # Bonus Check: Did an earlier Swing 0 also have the exact same target_red_count (3 Equal Swings)?
     for s0_end in range(s1_start - MIN_BOUNCE_BARS - 1, max(4, s1_start - MAX_BOUNCE_BARS - 2), -1):
-        cand_s0 = find_full_down_swing_ending_at(df_26m, s0_end)
-        if not cand_s0 or cand_s0["red_count"] != target_red_count:
-            continue
+        s0_candidates = find_all_valid_down_swings_ending_at(df_26m, s0_end)
+        for cand_s0 in s0_candidates:
+            if cand_s0["red_count"] != target_red_count:
+                continue
+            cand_r0 = find_preceding_impulse_rally(df_26m, cand_s0)
+            if not cand_r0:
+                continue
+            if validate_inter_swing_rally_and_support(df_26m, cand_s0, matched_s1, cand_r0["r_low"]):
+                if best_s2["swing_low"] > cand_r0["r_low"]:
+                    swing_count = 3
+                    base_rally_info = cand_r0
+                    break
+        if swing_count == 3:
+            break
 
-        cand_r0 = find_preceding_impulse_rally(df_26m, cand_s0)
-        if not cand_r0:
-            continue
-
-        if validate_inter_swing_rally_and_support(df_26m, cand_s0, matched_s1, cand_r0["r_low"]):
-            # Also ensure Swing 2 stayed strictly above Rally 0's base low
-            if s2_info["swing_low"] > cand_r0["r_low"]:
-                swing_count = 3
-                base_rally_info = cand_r0
-                break
-
-    # If evaluating an earlier bar in Full-Day After-Hours mode, verify subsequent bars
-    # did not crash below the preceding rally low (`L1` or `base_rally_info['r_low']`)
+    # Verify any subsequent bars after cur_idx did not breach the preceding rally low
     if cur_idx < len(df_26m) - 1:
         post_slice = df_26m.iloc[cur_idx + 1 :]
         post_min_low = float(post_slice["low"].min())
@@ -761,11 +784,11 @@ def evaluate_26m_at_bar_index(df_26m, cur_idx):
         "pattern_label": pattern_label,
         "rally_base_summary": f"{base_rally_info['r_low']:.1f} -> {base_rally_info['r_high']:.1f}",
         "s1_summary": f"{matched_s1['swing_high']:.1f}->{matched_s1['swing_low']:.1f} ({matched_s1['red_count']}R,{matched_s1['blue_count']}B)",
-        "s2_summary": f"{s2_info['swing_high']:.1f}->{s2_info['swing_low']:.1f} ({s2_info['red_count']}R,{s2_info['blue_count']}B)"
+        "s2_summary": f"{best_s2['swing_high']:.1f}->{best_s2['swing_low']:.1f} ({best_s2['red_count']}R,{best_s2['blue_count']}B)"
     }
 
 def evaluate_26m_equal_down_swings(df_26m, scan_all_today_bars=False):
-    if len(df_26m) < 20:
+    if len(df_26m) < 18:
         return None
 
     if not scan_all_today_bars:
@@ -774,7 +797,7 @@ def evaluate_26m_equal_down_swings(df_26m, scan_all_today_bars=False):
     latest_session_date = df_26m.index[-1].date()
     today_indices = [
         idx for idx, ts in enumerate(df_26m.index)
-        if ts.date() == latest_session_date and idx >= 15
+        if ts.date() == latest_session_date and idx >= 14
     ]
 
     best_match = None
@@ -831,11 +854,11 @@ def send_26m_equal_swing_email(triggered_list, bar_label, total_scanned):
         for m in ordered
     ]
 
-    plain_body = tabulate(table_rows, headers=headers, tablefmt="simple")
-    print(f"\n📊 {subject}\n{plain_body}\n")
+    plain_body = tabulate(table_rows, headers=headers, tablefmt="simple") if table_rows else "No contracts matched on this pass."
+    print(f"\n📊 {subject}\n{plain_body}\n", flush=True)
 
     if not SENDER_EMAIL or not RECEIVER_EMAIL or not APP_PASSWORD:
-        print("⚠️ Email credentials missing. Skipping email dispatch.")
+        print("⚠️ Email credentials missing. Skipping email dispatch.", flush=True)
         return
 
     for attempt in range(1, 4):
@@ -853,6 +876,19 @@ def send_26m_equal_swing_email(triggered_list, bar_label, total_scanned):
                 )
                 tr_list.append(f'<tr style="background-color:{bg};">{tds}</tr>')
 
+            table_section = (
+                f"""
+                <div style="overflow-x:auto;">
+                    <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
+                        <thead><tr>{th_html}</tr></thead>
+                        <tbody>{"".join(tr_list)}</tbody>
+                    </table>
+                </div>
+                """
+                if table_rows
+                else "<p style='color:#64748b;'>Scanner is active and basket is locked. No option contracts completed an Equal Down-Swing on the bars checked so far.</p>"
+            )
+
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
@@ -869,12 +905,7 @@ def send_26m_equal_swing_email(triggered_list, bar_label, total_scanned):
                 <p style="margin:0 0 14px 0;font-size:14px;color:#334155;">
                     <strong>All Triggered Contracts ({len(ordered)}):</strong> {all_syms}
                 </p>
-                <div style="overflow-x:auto;">
-                    <table style="border-collapse:collapse;font-family:'SFMono-Regular',Consolas,monospace;">
-                        <thead><tr>{th_html}</tr></thead>
-                        <tbody>{"".join(tr_list)}</tbody>
-                    </table>
-                </div>
+                {table_section}
             </body>
             </html>
             """
@@ -890,10 +921,10 @@ def send_26m_equal_swing_email(triggered_list, bar_label, total_scanned):
                 server.login(SENDER_EMAIL, APP_PASSWORD)
                 server.send_message(msg)
 
-            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} for {len(ordered)} contract(s)!")
+            print(f"✅ Alert Email sent successfully to {RECEIVER_EMAIL} ({len(ordered)} matches)!", flush=True)
             return
         except Exception as e:
-            print(f"⚠️ Email attempt {attempt}/3 failed: {e}")
+            print(f"⚠️ Email attempt {attempt}/3 failed: {e}", flush=True)
             time.sleep(3)
 
 # ==============================================================================
@@ -912,7 +943,7 @@ def get_expected_26m_bar_label(now_ist):
         bar_start = now_ist.replace(hour=bar_start_mins // 60, minute=bar_start_mins % 60, second=0, microsecond=0)
     return bar_start.strftime("%Y-%m-%d %H:%M")
 
-def run_26m_scanner(force_scan=False):
+def run_26m_scanner(force_scan=False, send_even_if_empty=False):
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
     memory = load_memory()
@@ -933,22 +964,22 @@ def run_26m_scanner(force_scan=False):
 
     options_list = memory.get("options", [])
     if not options_list:
-        print("⚠️ No Option contracts in basket.")
+        print("⚠️ No Option contracts in basket.", flush=True)
         return
 
     expected_bar_label = get_expected_26m_bar_label(now_ist)
-    scan_full_day = bool(force_scan and AFTER_HOURS_SCAN_ALL_TODAY_BARS)
+    scan_full_day = bool(force_scan or SCAN_ALL_COMPLETED_TODAY_BARS)
 
     if not force_scan and expected_bar_label is not None:
         if memory.get("last_scanned_26m_bar") == expected_bar_label:
-            print(f"ℹ️ 26m Bar [{expected_bar_label}] already scanned. Skipping duplicate pass.")
+            print(f"ℹ️ 26m Bar [{expected_bar_label}] already scanned. Skipping duplicate pass.", flush=True)
             return
 
     get_definedge_session_key()
     start_dt = (now_ist - timedelta(days=LOOKBACK_DAYS_1M)).replace(hour=9, minute=15, second=0, microsecond=0)
 
-    mode_desc = "FULL TODAY SESSION (All 15 Bars)" if scan_full_day else (expected_bar_label or "LATEST BAR")
-    print(f"\n🔎 Scanning {len(options_list)} Highest-OI Options on 26m Timeframe (Target: {mode_desc})...")
+    mode_desc = f"TODAY ALL COMPLETED BARS (Up to {expected_bar_label or 'Latest'})" if scan_full_day else (expected_bar_label or "LATEST BAR")
+    print(f"\n🔎 Scanning {len(options_list)} Highest-OI Options on 26m Timeframe (Target: {mode_desc})...", flush=True)
 
     def scan_single_option(opt):
         try:
@@ -964,10 +995,10 @@ def run_26m_scanner(force_scan=False):
                     return None
                 return {**opt, **res}
         except Exception as e:
-            print(f"  ⚠️ Error scanning {opt['trading_symbol']}: {e}")
+            print(f"  ⚠️ Error scanning {opt['trading_symbol']}: {e}", flush=True)
         return None
 
-    with ThreadPoolExecutor(max_workers=12) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         results = list(executor.map(scan_single_option, options_list))
 
     triggered = [r for r in results if r is not None]
@@ -976,18 +1007,19 @@ def run_26m_scanner(force_scan=False):
             f"  🔥 {m['pattern_label']} [{m['slot_hm']}]: {m['trading_symbol']} ({m['opt_type']} | "
             f"OI: {max(m.get('live_oi', 0), m.get('ref_oi', 0)):,}) | "
             f"RallyBase: {m['rally_base_summary']} | S1: {m['s1_summary']} | S2: {m['s2_summary']} | "
-            f"TrigClose: {m['close']} -> Latest: {m['latest_close']} (High: {m['post_high']})"
+            f"TrigClose: {m['close']} -> Latest: {m['latest_close']} (High: {m['post_high']})",
+            flush=True
         )
 
     bar_label_used = mode_desc if scan_full_day else (expected_bar_label or (triggered[0]["bar_iso"] if triggered else "LATEST"))
-    if expected_bar_label and not scan_full_day:
+    if expected_bar_label:
         memory["last_scanned_26m_bar"] = expected_bar_label
         save_memory(memory)
 
-    if triggered:
+    if triggered or send_even_if_empty:
         send_26m_equal_swing_email(triggered, bar_label_used, len(options_list))
     else:
-        print(f"ℹ️ No 26m Options completed a non-breach Equal Down-Swing setup on [{bar_label_used}].")
+        print(f"ℹ️ No 26m Options completed a non-breach Equal Down-Swing setup on [{bar_label_used}].", flush=True)
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -1000,37 +1032,27 @@ def heartbeat_sleep(target_dt):
 def stay_awake_26m_clock():
     now_ist = datetime.now(IST)
     session_mode = os.environ.get("SESSION_MODE", "AUTO").upper()
-    print(f"🕒 Starting 26m Equal Down-Swing Option Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} (Mode: {session_mode})")
+    print(f"🕒 Starting 26m Equal Down-Swing Option Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} (Mode: {session_mode})", flush=True)
 
     is_weekday = now_ist.weekday() < 5
     in_market_window = is_weekday and (dtime(9, 0) <= now_ist.time() <= dtime(15, 32))
 
     if not in_market_window:
-        print("⚡ Running immediate after-hours full-session 26m scan across all 15 bars of today...")
-        run_26m_scanner(force_scan=True)
+        print("⚡ Running immediate after-hours full-session 26m scan...", flush=True)
+        run_26m_scanner(force_scan=True, send_even_if_empty=True)
         return
 
     session_cutoff = dtime(12, 45) if session_mode == "MORNING" else dtime(15, 32)
 
-    memory = load_memory()
-    today_str = now_ist.strftime("%Y-%m-%d")
-    if (
-        memory.get("basket_date") != today_str
-        or memory.get("basket_version") != BASKET_VERSION
-        or not memory.get("options")
-    ):
-        print("🌅 Pre-warming today's Highest-OI CE & PE Option basket...")
-        new_basket = build_highest_oi_ce_pe_basket(now_ist)
-        if new_basket:
-            memory["basket_date"] = today_str
-            memory["basket_version"] = BASKET_VERSION
-            memory["options"] = new_basket
-            save_memory(memory)
+    # Immediately run an initial catch-up scan across all completed 26m bars of today so far!
+    if now_ist.time() >= dtime(9, 41, 12):
+        print("🚀 Running immediate startup catch-up scan across all completed 26m bars of today...", flush=True)
+        run_26m_scanner(force_scan=True, send_even_if_empty=SEND_HEARTBEAT_EMAIL_ON_FIRST_SCAN)
 
     while True:
         now_ist = datetime.now(IST)
         if now_ist.time() > session_cutoff:
-            print(f"⏹️ Reached session cutoff ({session_cutoff}). Exiting cleanly.")
+            print(f"⏹️ Reached session cutoff ({session_cutoff}). Exiting cleanly.", flush=True)
             break
 
         today_date = now_ist.date()
@@ -1041,16 +1063,16 @@ def stay_awake_26m_clock():
         ]
 
         if not future_points:
-            print(f"✅ All 26m checkpoints for {session_mode} completed.")
+            print(f"✅ All 26m checkpoints for {session_mode} completed.", flush=True)
             break
 
         next_dt = future_points[0]
         sleep_mins = round((next_dt - now_ist).total_seconds() / 60.0, 1)
-        print(f"💤 Sleeping {sleep_mins} min until next 26m checkpoint: {next_dt.strftime('%H:%M:%S IST')}...")
+        print(f"💤 Sleeping {sleep_mins} min until next 26m checkpoint: {next_dt.strftime('%H:%M:%S IST')}...", flush=True)
         heartbeat_sleep(next_dt)
 
-        print(f"\n🔔 26m Checkpoint reached at {datetime.now(IST).strftime('%H:%M:%S IST')}. Running scan...")
-        run_26m_scanner(force_scan=False)
+        print(f"\n🔔 26m Checkpoint reached at {datetime.now(IST).strftime('%H:%M:%S IST')}. Running scan...", flush=True)
+        run_26m_scanner(force_scan=False, send_even_if_empty=False)
 
 if __name__ == "__main__":
     stay_awake_26m_clock()
