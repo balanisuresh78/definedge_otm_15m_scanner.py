@@ -59,7 +59,7 @@ MEMORY_FILE = "mtf_129m_26m_st_memory.json"
 # ==============================================================================
 # 2. STRATEGY PARAMETERS (129m SUPERTREND 10,3.5 -> 26m TRIGGER)
 # ==============================================================================
-DATA_SEGMENT = "NSE"             # "NSE" (Continuous Spot Cash for all F&O stocks) or "NFO" (Near-Month Futures)
+DATA_SEGMENT = "NFO"             # "NSE" (Continuous Spot Cash for all F&O stocks) or "NFO" (Near-Month Futures)
 
 # Higher Timeframe (129m) Filter: Close < Supertrend(10, 3.5)
 ST_PERIOD = 10
