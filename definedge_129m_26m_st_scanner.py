@@ -57,11 +57,11 @@ IST = pytz.timezone("Asia/Kolkata")
 MEMORY_FILE = "mtf_129m_26m_st_memory.json"
 
 # ==============================================================================
-# 2. STRATEGY PARAMETERS (129m SUPERTREND 10,3.5 -> 26m TRIGGER)
+# 2. STRATEGY PARAMETERS (129m SUPERTREND 10,3.5 -> 26m TRIGGER ON FUTURES)
 # ==============================================================================
-DATA_SEGMENT = "NFO"             # "NSE" (Continuous Spot Cash for all F&O stocks) or "NFO" (Near-Month Futures)
+DATA_SEGMENT = "NFO"             # "NFO" (Near-Month Stock Futures) or "NSE" (Spot Cash)
 
-# Higher Timeframe (129m) Filter: Close < Supertrend(10, 3.5)
+# Higher Timeframe (129m) Filter: All stocks currently trading BELOW Supertrend(10, 3.5)
 ST_PERIOD = 10
 ST_MULTIPLIER = 3.5
 
@@ -71,10 +71,9 @@ ATR2_METHOD = "SMA"              # "SMA" or "RMA"
 ATR2_MULT_THRESHOLD = 1.34       # ATR(2) > previous bar ATR(2) * 1.34
 VOL_MULT_THRESHOLD = 1.25        # Vol > previous bar volume * 1.25
 
-# Lookback (35 calendar days = ~24 trading days = ~72 bars of 129m & ~360 bars of 26m)
-LOOKBACK_DAYS_1M = 35
+# Lookback (45 calendar days = ~31 trading days = ~93 bars of 129m for full ST convergence)
+LOOKBACK_DAYS_1M = 45
 
-# Email Dispatch Behavior:
 # Sends email immediately on startup, whenever a new 129m bar closes, and whenever >= 1 stock triggers on 26m
 SEND_EMAIL_ON_NEW_129M_BAR = True
 
@@ -208,10 +207,10 @@ def load_definedge_fno_tokens():
         with z.open(csv_name) as f:
             df = pd.read_csv(f, header=None, dtype=str, low_memory=False)
 
-    # Also auto-include any active FUTSTK underlying in NFO master
     nfo_fut = df[(df[0] == "NFO") & (df[4].str.strip() == "FUTSTK")].copy()
     nfo_fut[1] = nfo_fut[1].str.strip()
     nfo_fut[2] = nfo_fut[2].str.strip()
+    nfo_fut[3] = nfo_fut[3].str.strip()
 
     for exp_col in [5, 8, 6, 7]:
         if exp_col in nfo_fut.columns:
@@ -222,7 +221,10 @@ def load_definedge_fno_tokens():
 
     nfo_fut = nfo_fut[nfo_fut["expiry"].notna() & (nfo_fut["expiry"] >= today)]
     fut_near = nfo_fut.sort_values("expiry").groupby(2, as_index=False).first()
-    fut_map = {row[2]: row[1] for _, row in fut_near.iterrows()}
+    fut_map = {
+        row[2]: {"token": row[1], "trading_symbol": row[3]}
+        for _, row in fut_near.iterrows()
+    }
 
     combined_symbols = target_set.union(set(fut_map.keys()))
 
@@ -231,9 +233,12 @@ def load_definedge_fno_tokens():
         & (df[2].str.strip().isin(combined_symbols))
         & (df[4].str.strip() == "EQ")
     ].copy()
-    eq_map = {row[2].strip(): row[1].strip() for _, row in nse_eq.iterrows()}
+    eq_map = {
+        row[2].strip(): {"token": row[1].strip(), "trading_symbol": row[3].strip()}
+        for _, row in nse_eq.iterrows()
+    }
 
-    print(f"✅ Mapped {len(eq_map)} NSE Cash & {len(fut_map)} NFO Futures F&O stocks.", flush=True)
+    print(f"✅ Mapped {len(fut_map)} NFO Futures & {len(eq_map)} NSE Cash F&O stocks.", flush=True)
     return eq_map, fut_map
 
 def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
@@ -274,7 +279,7 @@ def fetch_definedge_1m_df(segment, token, start_dt, end_dt):
     return pd.DataFrame()
 
 # ==============================================================================
-# 5. RESAMPLING (129m & 26m) + INDICATORS (SUPERTREND 10,3.5 & ATR 2)
+# 5. RESAMPLING (129m & 26m) + ZERO-NaN SUPERTREND(10, 3.5) & ATR(2)
 # ==============================================================================
 def get_129m_bar_close_dt(bar_start_ts):
     t = bar_start_ts.time()
@@ -337,21 +342,25 @@ def resample_ohlcv(df_1m, now_ist, minutes):
     return out
 
 def compute_supertrend(df, period=10, multiplier=3.5):
-    """Computes standard Wilder ATR Supertrend(period, multiplier)."""
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
+    """
+    Computes standard Wilder ATR Supertrend(period, multiplier) with zero NaN
+    propagation from bar 0 so direction (-1 = below ST, +1 = above ST) is exact.
+    """
+    high = df["high"].astype(float).values
+    low = df["low"].astype(float).values
+    close = df["close"].astype(float).values
     n = len(df)
 
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]
-    tr = np.maximum(
-        high - low,
-        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close))
-    )
+    tr = np.zeros(n, dtype=float)
+    tr[0] = high[0] - low[0]
+    if n > 1:
+        tr[1:] = np.maximum(
+            high[1:] - low[1:],
+            np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
+        )
 
-    # Wilder's RMA for ATR(period)
-    atr = pd.Series(tr).ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean().values
+    # Wilder's RMA (min_periods=1 prevents NaN propagation into final_ub / final_lb)
+    atr = pd.Series(tr).ewm(alpha=1.0 / period, min_periods=1, adjust=False).mean().values
 
     hl2 = (high + low) / 2.0
     basic_ub = hl2 + multiplier * atr
@@ -359,8 +368,11 @@ def compute_supertrend(df, period=10, multiplier=3.5):
 
     final_ub = np.copy(basic_ub)
     final_lb = np.copy(basic_lb)
-    st = np.zeros(n)
+    st = np.zeros(n, dtype=float)
     direction = np.ones(n, dtype=int)  # 1 = Bullish (Close > ST), -1 = Bearish (Close < ST)
+
+    direction[0] = 1 if close[0] >= hl2[0] else -1
+    st[0] = final_lb[0] if direction[0] == 1 else final_ub[0]
 
     for i in range(1, n):
         if basic_ub[i] < final_ub[i - 1] or close[i - 1] > final_ub[i - 1]:
@@ -390,16 +402,17 @@ def compute_supertrend(df, period=10, multiplier=3.5):
 
     return st, direction
 
-def evaluate_stock_mtf(symbol, df_1m, now_ist):
+def evaluate_stock_mtf(symbol, contract_name, df_1m, now_ist):
     """
-    1. Checks 129m Supertrend(10, 3.5): Latest completed 129m bar must close BELOW Supertrend.
-    2. If shortlisted on 129m, checks 26m bar conditions:
+    1. Stage 1 (129m): Shortlists EVERY stock currently trading BELOW Supertrend(10, 3.5)
+       (whether it crossed below 1 bar ago or 25 bars ago).
+    2. Stage 2 (26m): Checks if the latest completed 26m bar fulfills:
        - Close > previous bar high
        - ATR(2) > previous bar ATR(2) * 1.34
        - Vol > previous bar volume * 1.25
     """
     df_129m = resample_ohlcv(df_1m, now_ist, minutes=129)
-    if len(df_129m) < ST_PERIOD + 5:
+    if len(df_129m) < ST_PERIOD + 2:
         return None
 
     st_vals, st_dir = compute_supertrend(df_129m, period=ST_PERIOD, multiplier=ST_MULTIPLIER)
@@ -408,9 +421,17 @@ def evaluate_stock_mtf(symbol, df_1m, now_ist):
     last_129m_dir = int(st_dir[-1])
     bar_129m_iso = df_129m.index[-1].strftime("%Y-%m-%d %H:%M")
 
-    # Stage 1 Filter: 129m bar closed BELOW Supertrend(10, 3.5)
+    # Stage 1 Filter: Trading BELOW 129m Supertrend(10, 3.5) (any duration)
     if not (last_129m_dir == -1 and last_129m_close < last_129m_st):
         return None
+
+    # Count how many consecutive 129m bars it has been trading below Supertrend
+    bars_below_st = 0
+    for k in range(len(st_dir) - 1, -1, -1):
+        if st_dir[k] == -1:
+            bars_below_st += 1
+        else:
+            break
 
     pct_below_st = round(((last_129m_st - last_129m_close) / last_129m_st) * 100.0, 2)
 
@@ -467,10 +488,12 @@ def evaluate_stock_mtf(symbol, df_1m, now_ist):
 
     return {
         "symbol": symbol,
+        "contract_name": contract_name,
         "bar_129m_iso": bar_129m_iso,
         "close_129m": round(last_129m_close, 2),
         "st_129m": round(last_129m_st, 2),
         "pct_below_st": pct_below_st,
+        "bars_below_st": bars_below_st,
         "triggered_26m": triggered_26m,
         "bar_26m_iso": bar_26m_iso,
         "slot_26m_hm": slot_26m_hm,
@@ -490,7 +513,7 @@ def evaluate_stock_mtf(symbol, df_1m, now_ist):
 def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m_label, total_scanned):
     now_str = datetime.now(IST).strftime("%d-%b %H:%M:%S")
     subject = (
-        f"⚡ 129m ST(10,3.5) Shortlist ({len(st_shortlist)}) | "
+        f"⚡ Futures 129m < ST(10,3.5) ({len(st_shortlist)}) | "
         f"26m Triggered ({len(triggered_26m)}) - [{bar_26m_label}] ({now_str})"
     )
 
@@ -500,13 +523,14 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
     syms_26m = ", ".join([m["symbol"] for m in ordered_26m]) or "None"
     syms_129m = ", ".join([m["symbol"] for m in ordered_129m]) or "None"
 
-    # Table 1: 26m Final Triggered Stocks
+    # Table 1: 26m Final Triggered Futures
     headers_26m = [
-        "Stock",
+        "Future",
         "26m Close > Prev High",
         "26m ATR(2) Ratio",
         "26m Vol Ratio",
         "129m Close < ST(10,3.5)",
+        "Bars < ST",
         "26m Bar"
     ]
     rows_26m = [
@@ -516,17 +540,19 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
             f"{m['atr2_ratio']:.2f}x ({m['atr2_cur']:.2f}/{m['atr2_prev']:.2f})",
             f"{m['vol_ratio']:.2f}x ({m['vol_cur']:,})",
             f"{m['close_129m']:.2f} < {m['st_129m']:.2f} (-{m['pct_below_st']:.2f}%)",
+            f"{m['bars_below_st']}b",
             m["slot_26m_hm"]
         ]
         for m in ordered_26m
     ]
 
-    # Table 2: All 129m Supertrend (< ST) Shortlisted Stocks
+    # Table 2: All 129m Trading Below Supertrend(10, 3.5) Shortlisted Futures
     headers_129m = [
-        "Stock",
+        "Future",
         "129m Close",
         "129m ST(10,3.5)",
         "% Below ST",
+        "Bars < ST",
         "26m Status (ATR2x | Volx)"
     ]
     rows_129m = [
@@ -535,16 +561,17 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
             f"{m['close_129m']:.2f}",
             f"{m['st_129m']:.2f}",
             f"-{m['pct_below_st']:.2f}%",
+            f"{m['bars_below_st']}b",
             f"🔥 TRIGGERED ({m['atr2_ratio']:.2f}x | {m['vol_ratio']:.2f}x)" if m["triggered_26m"] else f"Watching ({m['atr2_ratio']:.2f}x | {m['vol_ratio']:.2f}x)"
         ]
         for m in ordered_129m
     ]
 
-    plain_26m = tabulate(rows_26m, headers=headers_26m, tablefmt="simple") if rows_26m else "No stocks triggered all 26m conditions on this bar."
+    plain_26m = tabulate(rows_26m, headers=headers_26m, tablefmt="simple") if rows_26m else "No futures triggered all 26m conditions on this bar."
     plain_129m = tabulate(rows_129m, headers=headers_129m, tablefmt="simple") if rows_129m else "None"
     plain_body = (
-        f"=== 26m TRIGGERED STOCKS ({len(ordered_26m)}) ===\n{plain_26m}\n\n"
-        f"=== ALL 129m CLOSE < ST(10,3.5) SHORTLIST ({len(ordered_129m)}) ===\n{plain_129m}"
+        f"=== 26m TRIGGERED FUTURES ({len(ordered_26m)}) ===\n{plain_26m}\n\n"
+        f"=== ALL 129m TRADING BELOW ST(10,3.5) ({len(ordered_129m)}) ===\n{plain_129m}"
     )
     print(f"\n📊 {subject}\n{plain_body}\n", flush=True)
 
@@ -578,12 +605,12 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
     table_26m_html = (
         build_html_table(headers_26m, rows_26m, highlight_col_idx=0, highlight_token="")
         if rows_26m
-        else "<p style='color:#64748b;margin:0 0 16px 0;'>No stocks fulfilled all three 26m breakout conditions on this bar.</p>"
+        else "<p style='color:#64748b;margin:0 0 16px 0;'>No futures fulfilled all three 26m breakout conditions on this bar.</p>"
     )
     table_129m_html = (
-        build_html_table(headers_129m, rows_129m, highlight_col_idx=4, highlight_token="TRIGGERED")
+        build_html_table(headers_129m, rows_129m, highlight_col_idx=5, highlight_token="TRIGGERED")
         if rows_129m
-        else "<p style='color:#64748b;'>No F&O stocks closed below 129m Supertrend(10, 3.5).</p>"
+        else "<p style='color:#64748b;'>No F&O futures are currently below 129m Supertrend(10, 3.5).</p>"
     )
 
     for attempt in range(1, 4):
@@ -591,20 +618,20 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
             html_body = f"""
             <html>
             <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 15px; color: #0f172a;">
-                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ 129m Supertrend(10, 3.5) Bearish Shortlist &rarr; 26m Breakout Trigger</strong></p>
+                <p style="margin:0 0 8px 0;font-size:16px;"><strong>⚡ Stock Futures ({DATA_SEGMENT}): 129m Below Supertrend(10, 3.5) &rarr; 26m Breakout Trigger</strong></p>
                 <p style="margin:0 0 14px 0; color:#475569;font-size:15px;">
                     <strong>26m Bar:</strong> {bar_26m_label} &nbsp;|&nbsp;
                     <strong>129m Bar:</strong> {bar_129m_label} &nbsp;|&nbsp;
-                    <strong>F&amp;O Scanned:</strong> {total_scanned} &nbsp;|&nbsp;
+                    <strong>Futures Scanned:</strong> {total_scanned} &nbsp;|&nbsp;
                     <strong>129m &lt; ST:</strong> {len(ordered_129m)} &nbsp;|&nbsp;
                     <strong>26m Triggered:</strong> {len(ordered_26m)}
                 </p>
 
-                <p style="margin:0 0 4px 0;"><strong>🔥 26m FINAL TRIGGERED STOCKS ({len(ordered_26m)}):</strong></p>
+                <p style="margin:0 0 4px 0;"><strong>🔥 26m FINAL TRIGGERED FUTURES ({len(ordered_26m)}):</strong></p>
                 <pre style="background:#f0fdf4;border:1px solid #bbf7d0;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{syms_26m}</pre>
                 {table_26m_html}
 
-                <p style="margin:0 0 4px 0;"><strong>📋 ALL 129m CLOSE &lt; SUPERTREND(10, 3.5) SHORTLISTED STOCKS ({len(ordered_129m)}):</strong></p>
+                <p style="margin:0 0 4px 0;"><strong>📋 ALL FUTURES TRADING BELOW 129m SUPERTREND(10, 3.5) ({len(ordered_129m)}):</strong></p>
                 <pre style="background:#f1f5f9;padding:10px;border-radius:4px;margin:0 0 12px 0;white-space:pre-wrap;font-size:14px;">{syms_129m}</pre>
                 {table_129m_html}
             </body>
@@ -622,7 +649,7 @@ def send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_label, bar_129m
                 server.login(SENDER_EMAIL, APP_PASSWORD)
                 server.send_message(msg)
 
-            print(f"✅ Email sent to {RECEIVER_EMAIL} (129m Shortlist: {len(ordered_129m)}, 26m Triggered: {len(ordered_26m)})!", flush=True)
+            print(f"✅ Email sent to {RECEIVER_EMAIL} (129m < ST: {len(ordered_129m)}, 26m Triggered: {len(ordered_26m)})!", flush=True)
             return
         except Exception as e:
             print(f"⚠️ Email attempt {attempt}/3 failed: {e}", flush=True)
@@ -656,21 +683,21 @@ def run_mtf_scanner(force_scan=False):
 
     get_definedge_session_key()
     eq_map, fut_map = load_definedge_fno_tokens()
-    token_map = eq_map if DATA_SEGMENT.upper() == "NSE" else fut_map
+    token_map = fut_map if DATA_SEGMENT.upper() == "NFO" else eq_map
     symbols_list = sorted(token_map.keys())
 
     start_dt = (now_ist - timedelta(days=LOOKBACK_DAYS_1M)).replace(hour=9, minute=15, second=0, microsecond=0)
-    print(f"\n🔎 Scanning {len(symbols_list)} F&O Stocks (129m ST(10,3.5) -> 26m Trigger) [Target 26m: {expected_26m or 'LATEST'}]...", flush=True)
+    print(f"\n🔎 Scanning {len(symbols_list)} {DATA_SEGMENT} Futures (129m < ST(10,3.5) -> 26m Trigger) [Target 26m: {expected_26m or 'LATEST'}]...", flush=True)
 
     def scan_single_stock(symbol):
-        token = token_map.get(symbol)
-        if not token:
+        info = token_map.get(symbol)
+        if not info:
             return None
         try:
-            df_1m = fetch_definedge_1m_df(DATA_SEGMENT.upper(), token, start_dt, now_ist)
+            df_1m = fetch_definedge_1m_df(DATA_SEGMENT.upper(), info["token"], start_dt, now_ist)
             if df_1m.empty:
                 return None
-            return evaluate_stock_mtf(symbol, df_1m, now_ist)
+            return evaluate_stock_mtf(symbol, info["trading_symbol"], df_1m, now_ist)
         except Exception as e:
             print(f"  ⚠️ Error scanning {symbol}: {e}", flush=True)
             return None
@@ -684,11 +711,11 @@ def run_mtf_scanner(force_scan=False):
     bar_26m_used = expected_26m or (st_shortlist[0]["bar_26m_iso"] if st_shortlist else "LATEST")
     bar_129m_used = st_shortlist[0]["bar_129m_iso"] if st_shortlist else "LATEST"
 
-    print(f"📌 Stage 1 (129m Close < ST 10,3.5): {len(st_shortlist)}/{len(symbols_list)} F&O stocks shortlisted.", flush=True)
+    print(f"📌 Stage 1 (129m Below ST 10,3.5): {len(st_shortlist)}/{len(symbols_list)} futures shortlisted.", flush=True)
     for m in triggered_26m:
         print(
             f"  🔥 26m TRIGGER: {m['symbol']} | Close {m['close_26m']} > PrevH {m['prev_high_26m']} | "
-            f"ATR2: {m['atr2_ratio']}x | Vol: {m['vol_ratio']}x | 129m: {m['close_129m']} < ST {m['st_129m']}",
+            f"ATR2: {m['atr2_ratio']}x | Vol: {m['vol_ratio']}x | 129m: {m['close_129m']} < ST {m['st_129m']} ({m['bars_below_st']}b)",
             flush=True
         )
 
@@ -704,7 +731,7 @@ def run_mtf_scanner(force_scan=False):
     if should_email:
         send_mtf_129m_26m_email(st_shortlist, triggered_26m, bar_26m_used, bar_129m_used, len(symbols_list))
     else:
-        print(f"ℹ️ 129m Shortlist ({len(st_shortlist)} stocks) unchanged; 0 new 26m triggers on [{bar_26m_used}].", flush=True)
+        print(f"ℹ️ 129m Shortlist ({len(st_shortlist)} futures) unchanged; 0 new 26m triggers on [{bar_26m_used}].", flush=True)
 
 def heartbeat_sleep(target_dt):
     while True:
@@ -717,7 +744,7 @@ def heartbeat_sleep(target_dt):
 def stay_awake_mtf_clock():
     now_ist = datetime.now(IST)
     session_mode = os.environ.get("SESSION_MODE", "AUTO").upper()
-    print(f"🕒 Starting 129m ST(10,3.5) -> 26m Breakout Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} (Mode: {session_mode})", flush=True)
+    print(f"🕒 Starting Futures 129m < ST(10,3.5) -> 26m Breakout Scanner at {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} (Mode: {session_mode})", flush=True)
 
     is_weekday = now_ist.weekday() < 5
     in_market_window = is_weekday and (dtime(9, 0) <= now_ist.time() <= dtime(15, 32))
@@ -729,7 +756,6 @@ def stay_awake_mtf_clock():
 
     session_cutoff = dtime(12, 45) if session_mode == "MORNING" else dtime(15, 32)
 
-    # Immediate startup pass so you get the current 129m shortlist + 26m triggers right away
     if now_ist.time() >= dtime(9, 41, 10):
         print("🚀 Running immediate startup pass...", flush=True)
         run_mtf_scanner(force_scan=True)
