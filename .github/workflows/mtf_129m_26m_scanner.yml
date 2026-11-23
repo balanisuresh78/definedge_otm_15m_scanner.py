@@ -2,11 +2,21 @@ name: 129m Supertrend -> 26m Breakout Scanner (228 F&O)
 
 on:
   schedule:
-    # Morning Session: Starts 09:15 AM IST (03:45 UTC)
-    - cron: '45 3 * * 1-5'
-    # Afternoon Session: Starts 12:45 PM IST (07:15 UTC)
-    - cron: '15 7 * * 1-5'
+    # Morning Session: 09:02 AM IST (03:32 UTC) — off-peak minute, safely after 09:00 IST window
+    - cron: '32 3 * * 1-5'
+    # Afternoon Session: 12:42 PM IST (07:12 UTC) — queues behind Morning until 12:45 IST handoff
+    - cron: '12 7 * * 1-5'
   workflow_dispatch:
+    inputs:
+      session_mode:
+        description: 'Session mode for manual run'
+        required: false
+        default: 'AUTO'
+        type: choice
+        options:
+          - AUTO
+          - MORNING
+          - AFTERNOON
 
 concurrency:
   group: mtf-129m-26m-st-scanner
@@ -15,7 +25,7 @@ concurrency:
 jobs:
   scan-129m-26m-st:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -55,6 +65,14 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            export SESSION_MODE="${{ inputs.session_mode }}"
+          elif [ "${{ github.event.schedule }}" = "32 3 * * 1-5" ]; then
+            export SESSION_MODE="MORNING"
+          else
+            export SESSION_MODE="AFTERNOON"
+          fi
+          echo "Resolved SESSION_MODE=$SESSION_MODE"
           python definedge_129m_26m_st_scanner.py
 
       - name: Save mtf_129m_26m_st_memory.json to Cache
