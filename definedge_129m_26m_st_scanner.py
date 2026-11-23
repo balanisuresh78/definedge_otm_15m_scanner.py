@@ -404,13 +404,23 @@ def compute_supertrend(df, period=10, multiplier=3.5):
 
 def evaluate_stock_mtf(symbol, contract_name, df_1m, now_ist):
     """
-    1. Stage 1 (129m): Shortlists EVERY stock currently trading BELOW Supertrend(10, 3.5)
+    1. Stage 1 (Daily + 129m): Shortlists EVERY stock where Yesterday's Close < Previous Close
+       AND currently trading BELOW 129m Supertrend(10, 3.5)
        (whether it crossed below 1 bar ago or 25 bars ago).
     2. Stage 2 (26m): Checks if the latest completed 26m bar fulfills:
        - Close > previous bar high
        - ATR(2) > previous bar ATR(2) * 1.34
        - Vol > previous bar volume * 1.25
     """
+    # Daily Trend Filter: Yesterday's Close (D-1) < Previous Close (D-2)
+    df_reg = df_1m.between_time("09:15", "15:29")
+    if df_reg.empty:
+        return None
+    daily_closes = df_reg["close"].groupby(df_reg.index.date).last()
+    past_closes = daily_closes[daily_closes.index < now_ist.date()]
+    if len(past_closes) < 2 or not (float(past_closes.iloc[-1]) < float(past_closes.iloc[-2])):
+        return None
+
     df_129m = resample_ohlcv(df_1m, now_ist, minutes=129)
     if len(df_129m) < ST_PERIOD + 2:
         return None
